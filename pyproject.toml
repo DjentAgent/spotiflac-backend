@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "spotiflac-backend"
+version = "0.1.0"
+description = "Backend for SpotiFlac service"
+authors = ["Your Name <you@example.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0"
+fastapi       = "^0.116.1"
+uvicorn       = { version = "^0.21.0", extras = ["standard"] }
+httpx         = "^0.28.0"      # >=0.25.0 для совместимости с respx
+beautifulsoup4 = "^4.12.0"
+lxml          = "^4.9.3"
+pydantic      = "^2.0.0"       # для BaseSettings
+pydantic-settings = "^2.0.0"
+
+[tool.poetry.dev-dependencies]
+pytest         = "^7.4.0"
+pytest-asyncio = "^0.20.3"
+respx          = "^0.22.0"      # последняя 0.22.x, завязанная на httpx>=0.25
+
+[build-system]
+requires    = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
