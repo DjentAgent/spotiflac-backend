@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from spotiflac_backend.services.rutracker import RutrackerService
 
-router = APIRouter(prefix="/torrents")
+router = APIRouter(prefix="")
 
 
 class TorrentInfoResponse(BaseModel):
