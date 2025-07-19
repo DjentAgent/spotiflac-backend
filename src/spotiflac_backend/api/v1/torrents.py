@@ -38,7 +38,9 @@ async def search_torrents(
 
 # Подключаем Redis (заранее в settings.redis_url сконфигурирован URL вида "redis://...")
 redis: aioredis.Redis = aioredis.from_url(
-    settings.redis_url, encoding=None, decode_responses=False
+    settings.redis_url,
+    encoding="utf-8",     # ← вот это
+    decode_responses=False  # и чтобы значения (торренты) шли в виде bytes
 )
 
 
