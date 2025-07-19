@@ -7,8 +7,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        # extra по умолчанию = "ignore", но раз уж
-        # мы явно описали все поля, можно не менять
     )
 
     # prod‑зависимые настройки

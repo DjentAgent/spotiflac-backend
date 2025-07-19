@@ -88,37 +88,62 @@ class RutrackerService:
             final.raise_for_status()
             log.debug("Final page after login GET status: %s", final.status_code)
 
-    def _search_sync(self, query: str) -> List[TorrentInfo]:
+    def _search_sync(self, query: str) -> List[str]:
+        # 1) логинимся на rutracker
         self._login_sync()
 
-        url = f"{self.base_url}/forum/tracker.php"
-        log.debug("=== Search: GET %s?nm=%r ===", url, query)
-        r = self.scraper.get(url, params={"nm": query})
-        log.debug("Search GET status: %s", r.status_code)
+        # 2) GET формы расширенного поиска, чтобы собрать все скрытые поля
+        search_url = f"{self.base_url}/forum/tracker.php"
+        log.debug("=== Search: GET form %s?nm=%r ===", search_url, query)
+        r = self.scraper.get(search_url, params={"nm": query})
         r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "lxml")
-        rows = soup.select("tr.topicrow")
-        log.debug("Found %d rows", len(rows))
+        form = soup.find("form", id="tr-form")
+        if not form:
+            raise RuntimeError("Advanced search form not found on tracker.php")
 
-        result: List[TorrentInfo] = []
+        # 3) Определяем URL для POST
+        action = form["action"]
+        if not action.startswith("http"):
+            action = f"{self.base_url}/forum/{action.lstrip('/')}"
+
+        # 4) Собираем все скрытые поля
+        data = {
+            inp["name"]: inp.get("value", "")
+            for inp in form.find_all("input", {"type": "hidden"})
+            if inp.has_attr("name")
+        }
+        # Подставляем наш поисковый запрос и устанавливаем f[] = -1 (все разделы)
+        data["nm"] = query
+        data["f[]"] = "-1"
+
+        # 5) POST-им форму поиска
+        log.debug("=== Search: POST %s ===", action)
+        r = self.scraper.post(action, data=data)
+        r.raise_for_status()
+
+        # 6) Парсим результаты — строки с раздачами имеют атрибут data-topic_id
+        soup = BeautifulSoup(r.text, "lxml")
+        rows = soup.select("tr[data-topic_id]")
+        log.debug("Found %d result rows", len(rows))
+
+        for idx, row in enumerate(rows, 1):
+            # получить весь текст в строке, очистив лишние пробелы
+            text = row.get_text(separator=' ', strip=True)
+            log.debug("Row %d text: %s", idx, text)
+            print(f"{idx}: {text}\n")
+
+
+        # 7) Собираем только названия
+        titles: List[str] = []
         for row in rows:
-            a = row.find("a", href=True, title=True)
-            title = a["title"]
-            link = self.base_url + "/forum/" + a["href"].lstrip("/")
-            size = row.select_one("td.col3").text.strip()
-            stats = row.select_one("td.col5").text.strip().split("/")
-            seeders, leechers = map(int, stats)
-            result.append(TorrentInfo(
-                title=title,
-                url=link,
-                size=size,
-                seeders=seeders,
-                leechers=leechers,
-            ))
+            a = row.find("a", title=True)
+            if a:
+                titles.append(a["title"])
+                log.debug("Parsed title: %s", a["title"])
 
-        log.debug("Returning %d parsed results", len(result))
-        return result
+        return titles
 
     async def search(self, query: str) -> List[TorrentInfo]:
         import asyncio
