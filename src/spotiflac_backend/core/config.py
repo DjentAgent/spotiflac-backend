@@ -1,24 +1,18 @@
 # src/spotiflac_backend/core/config.py
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings
+from pydantic import Field
 
 class Settings(BaseSettings):
-    # где брать .env
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-    )
+    rutracker_login: str = Field(..., env="RUTRACKER_LOGIN")
+    rutracker_password: str = Field(..., env="RUTRACKER_PASSWORD")
+    rutracker_base: str = Field("https://rutracker.org", env="RUTRACKER_BASE")
+    redis_url: str = Field("redis://localhost:6379/0", env="REDIS_URL")
+    rutracker_cookie_ttl: int = Field(86400, env="RUTRACKER_COOKIE_TTL")
 
-    # prod‑зависимые настройки
-    redis_url: str = "redis://localhost:6379/0"
-    rutracker_base: str = "https://rutracker.org"
-    torrent_path: str = "/tmp/torrents"
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "forbid"
 
-    # теперь добавляем поля для логина
-    rutracker_login: str        # будет браться из RUTRACKER_LOGIN
-    rutracker_password: str     # будет браться из RUTRACKER_PASSWORD
-
-# единственный экземпляр конфига
 settings = Settings()
-
-

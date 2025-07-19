@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: spotiflac_redis
+    ports:
+      - "6379:6379"
+    # если нужно персистить данные
+    # volumes:
+    #   - redis_data:/data
+
+  backend:
+    build: .
+    container_name: spotiflac_backend
+    command: uvicorn spotiflac_backend.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      # подхватываем из .env или из вашей оболочки
+      - RUTRACKER_LOGIN=${RUTRACKER_LOGIN}
+      - RUTRACKER_PASSWORD=${RUTRACKER_PASSWORD}
+      - RUTRACKER_BASE=${RUTRACKER_BASE}
+      - REDIS_URL=redis://redis:6379/0
+      - RUTRACKER_COOKIE_TTL=86400
+    depends_on:
+      - redis
+
+#volumes:
+#  redis_data:
+#    driver: local

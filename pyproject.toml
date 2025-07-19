@@ -13,6 +13,10 @@ beautifulsoup4 = "^4.12.0"
 lxml          = "^4.9.3"
 pydantic      = "^2.0.0"       # для BaseSettings
 pydantic-settings = "^2.0.0"
+aioredis = "^2.0.1"
+redis = { version = "^4.5.5" }
+fastapi-cache2 = { version = "^0.2.2", extras = ["redis"] }
+cloudscraper = "^1.2.69"
 
 [tool.poetry.dev-dependencies]
 pytest         = "^7.4.0"
