@@ -3,68 +3,63 @@
 import json
 import logging
 import re
-from typing import List
+from typing import List, Optional
 from urllib.parse import urljoin
 
 import cloudscraper
-from bs4 import BeautifulSoup
-
 import redis
-from redis.exceptions import RedisError
+from bs4 import BeautifulSoup
 
 from spotiflac_backend.core.config import settings
 from spotiflac_backend.models.torrent import TorrentInfo
 
 log = logging.getLogger(__name__)
 
+# ищем lossless‑форматы
+_LOSSLESS_RE = re.compile(r"\b(flac|wavpack|ape|alac)\b", re.IGNORECASE)
+# ищем lossy‑форматы
+_LOSSY_RE    = re.compile(r"\b(mp3|aac|ogg|opus)\b", re.IGNORECASE)
+
 
 class RutrackerService:
     def __init__(self, base_url: str = None):
         self.base_url = (base_url or settings.rutracker_base).rstrip("/")
-        # cloudscraper для обхода Cloudflare
         self.scraper = cloudscraper.create_scraper(
             browser={"custom": "SpotiFlac/1.0"},
             delay=10,
         )
-        # TTL хранения cookies в секундах
+        self.redis = redis.Redis.from_url(settings.redis_url)
         self.cookie_ttl = getattr(settings, "rutracker_cookie_ttl", 24 * 3600)
 
-        # Попытка инициализировать Redis‑клиент и загрузить cookies
-        self.redis = None
+        # Попытаться восстановить cookie‑jar из Redis
         try:
-            self.redis = redis.Redis.from_url(settings.redis_url, socket_timeout=1)
             raw = self.redis.get("rutracker:cookiejar")
             if raw:
                 jar = json.loads(raw)
                 self.scraper.cookies.update(jar)
                 log.debug("Loaded Rutracker cookies from Redis")
-        except RedisError:
-            log.warning("Redis unavailable, proceeding without cookie cache", exc_info=True)
+        except Exception:
+            log.exception("Failed to load cookies from Redis, will re-login on demand")
 
     def _ensure_login(self):
-        """
-        Убедиться, что в scraper есть действующая sesssion‑cookie.
-        Если нет — выполнить _login_sync() и закешировать cookies.
-        """
         jar = self.scraper.cookies.get_dict()
         if jar.get("bb_session") or jar.get("bb_sessionhash"):
-            return  # уже залогинены
+            return
 
-        # нет действующей сессии — логинимся
+        # иначе залогиниться
         self._login_sync()
 
-        # после логина пытаемся сохранить cookies
-        if self.redis:
-            try:
-                new_jar = self.scraper.cookies.get_dict()
-                self.redis.set(
-                    "rutracker:cookiejar",
-                    json.dumps(new_jar),
-                    ex=self.cookie_ttl
-                )
-                log.debug("Saved Rutracker cookies to Redis (ttl=%d)", self.cookie_ttl)
-            except RedisError:
-                log.warning("Failed to save cookies to Redis", exc_info=True)
+        # и закешировать куки
+        try:
+            new_jar = self.scraper.cookies.get_dict()
+            self.redis.set(
+                "rutracker:cookiejar",
+                json.dumps(new_jar),
+                ex=self.cookie_ttl
+            )
+            log.debug("Saved new Rutracker cookies to Redis (ttl=%d)", self.cookie_ttl)
+        except Exception:
+            log.exception("Failed to save cookies to Redis")
 
     def _login_sync(self):
         login_url = f"{self.base_url}/forum/login.php"
@@ -108,12 +103,11 @@ class RutrackerService:
         post.raise_for_status()
 
         cookies = self.scraper.cookies.get_dict()
-        session_cookie = cookies.get("bb_sessionhash") or cookies.get("bb_session")
-        if not session_cookie:
-            raise RuntimeError("Login failed — bb_session or bb_sessionhash cookie not found")
-        log.debug("Login successful, session_cookie=%s", session_cookie)
+        if not (cookies.get("bb_sessionhash") or cookies.get("bb_session")):
+            raise RuntimeError("Login failed — bb_session или bb_sessionhash cookie не найдена")
+        log.debug("Login successful, session_cookie=%s", cookies.get("bb_session") or cookies.get("bb_sessionhash"))
 
-        # Follow redirect if present
+        # follow redirect
         location = post.headers.get("Location")
         if location:
             if not location.startswith("http"):
@@ -123,11 +117,18 @@ class RutrackerService:
             final.raise_for_status()
             log.debug("Final GET after login status: %s", final.status_code)
 
-    def _search_sync(self, query: str) -> List[TorrentInfo]:
-        # гарантируем, что залогинены
+    def _search_sync(
+        self,
+        query: str,
+        only_lossless: Optional[bool] = None
+    ) -> List[TorrentInfo]:
+        """
+        Если only_lossless is True — возвращаем только lossless,
+        если False — только lossy, если None — всё подряд.
+        """
         self._ensure_login()
 
-        # 1) GET форму поиска
+        # 1) GET формы
         search_url = f"{self.base_url}/forum/tracker.php"
         log.debug("=== Search: GET %s?nm=%r ===", search_url, query)
         r = self.scraper.get(search_url, params={"nm": query})
@@ -138,7 +139,7 @@ class RutrackerService:
         if not form:
             raise RuntimeError("Advanced search form not found on tracker.php")
 
-        # 2) Собираем POST‑данные
+        # 2) hidden inputs
         action = form["action"]
         if not action.startswith("http"):
             action = f"{self.base_url}/forum/{action.lstrip('/')}"
@@ -149,27 +150,37 @@ class RutrackerService:
         }
         data.update({"nm": query, "f[]": "-1"})
 
-        # 3) POST запрос
+        # 3) POST
         log.debug("=== Search: POST %s ===", action)
         r = self.scraper.post(action, data=data)
         r.raise_for_status()
 
-        # 4) Парсим результаты
+        # 4) результат
         soup = BeautifulSoup(r.text, "lxml")
         rows = soup.select("tr[data-topic_id]")
         log.debug("Found %d result rows", len(rows))
 
         results: List[TorrentInfo] = []
+
         for idx, row in enumerate(rows, start=1):
             title_a = row.select_one("td.t-title-col a.tLink")
             if not title_a:
-                log.debug("Row #%d: no title link, skip", idx)
                 continue
             title = title_a.text.strip()
 
+            is_lossless = bool(_LOSSLESS_RE.search(title))
+            is_lossy    = bool(_LOSSY_RE.search(title))
+
+            # применяем фильтр
+            if only_lossless is True and (not is_lossless or is_lossy):
+                log.debug("Row #%d skip (need lossless): %s", idx, title)
+                continue
+            if only_lossless is False and is_lossless:
+                log.debug("Row #%d skip (need lossy): %s", idx, title)
+                continue
+
             a_dl = row.find("a", href=re.compile(r"dl\.php\?t="))
             if not a_dl:
-                log.debug("Row #%d: no dl.php link, skip", idx)
                 continue
             torrent_url = urljoin(f"{self.base_url}/forum/", a_dl["href"])
             size = a_dl.text.strip().replace("\xa0", " ").replace("↓", "").strip()
@@ -195,18 +206,16 @@ class RutrackerService:
 
         return results
 
-    async def search(self, query: str) -> List[TorrentInfo]:
+    async def search(
+        self,
+        query: str,
+        only_lossless: Optional[bool] = None
+    ) -> List[TorrentInfo]:
         import asyncio
-        try:
-            return await asyncio.to_thread(self._search_sync, query)
-        except Exception:
-            log.exception("RutrackerService.search() failed")
-            return []
+        return await asyncio.to_thread(self._search_sync, query, only_lossless)
 
     def _download_sync(self, topic_id: int) -> bytes:
-        # убедимся, что залогинены
         self._ensure_login()
-
         dl_url = f"{self.base_url}/forum/dl.php?t={topic_id}"
         log.debug("Downloading torrent %s", dl_url)
         resp = self.scraper.get(dl_url, allow_redirects=True)
@@ -218,5 +227,4 @@ class RutrackerService:
         return await asyncio.to_thread(self._download_sync, topic_id)
 
     async def close(self):
-        # нет явных ресурсов для закрытия
         pass
