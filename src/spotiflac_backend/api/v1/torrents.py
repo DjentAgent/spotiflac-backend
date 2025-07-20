@@ -29,12 +29,16 @@ async def search_torrents(
         None,
         title="Only lossless",
         description="Если true — возвращать только lossless (FLAC и т.п.), если false — только lossy, если не указано — всё"
+    ),
+    track: Optional[str] = Query(
+        None,
+        title="Track name",
+        description="Если указано, будет возвращать только раздачи, где внутри .torrent есть этот трек"
     )
 ):
     svc = RutrackerService()
     try:
-        # Передаём флаг фильтрации
-        return await svc.search(q, only_lossless=lossless)
+        return await svc.search(q, only_lossless=lossless, track=track)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
     finally:

@@ -17,6 +17,8 @@ aioredis = "^2.0.1"
 redis = { version = "^4.5.5" }
 fastapi-cache2 = { version = "^0.2.2", extras = ["redis"] }
 cloudscraper = "^1.2.69"
+bencodepy = "^0.9.5"
+rapidfuzz = "^3.13.0"
 
 [tool.poetry.dev-dependencies]
 pytest         = "^7.4.0"
