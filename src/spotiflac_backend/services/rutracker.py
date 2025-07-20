@@ -19,6 +19,12 @@ log = logging.getLogger(__name__)
 _LOSSLESS_RE = re.compile(r"\b(flac|wavpack|ape|alac)\b", re.IGNORECASE)
 _LOSSY_RE    = re.compile(r"\b(mp3|aac|ogg|opus)\b", re.IGNORECASE)
 
+# Регэксп для выдёргивания search_id
+_PG_BASE_URL_RE = re.compile(
+    r"PG_BASE_URL\s*:\s*['\"][^?]+\?([^'\"]+)['\"]",
+    re.IGNORECASE
+)
+
 
 class RutrackerService:
     def __init__(self, base_url: str = None):
@@ -103,7 +109,10 @@ class RutrackerService:
         cookies = self.scraper.cookies.get_dict()
         if not (cookies.get("bb_sessionhash") or cookies.get("bb_session")):
             raise RuntimeError("Login failed — bb_session или bb_sessionhash cookie не найдена")
-        log.debug("Login successful, session_cookie=%s", cookies.get("bb_sessionhash") or cookies.get("bb_session"))
+        log.debug(
+            "Login successful, session_cookie=%s",
+            cookies.get("bb_sessionhash") or cookies.get("bb_session")
+        )
 
         # follow redirect
         location = post.headers.get("Location")
@@ -123,12 +132,10 @@ class RutrackerService:
         self._ensure_login()
 
         search_url = f"{self.base_url}/forum/tracker.php"
-        # 1) Получаем саму страницу с формой (GET)
         log.debug("=== Search: GET %s?nm=%r ===", search_url, query)
         r = self.scraper.get(search_url, params={"nm": query})
         r.raise_for_status()
 
-        # 2) Собираем POST‑данные из формы
         soup = BeautifulSoup(r.text, "lxml")
         form = soup.find("form", id="tr-form")
         if not form:
@@ -137,6 +144,7 @@ class RutrackerService:
         action = form["action"]
         if not action.startswith("http"):
             action = f"{self.base_url}/forum/{action.lstrip('/')}"
+
         post_data = {
             inp["name"]: inp.get("value", "")
             for inp in form.find_all("input", {"type": "hidden"})
@@ -144,45 +152,38 @@ class RutrackerService:
         }
         post_data.update({"nm": query, "f[]": "-1"})
 
-        # 3) Первый POST – выдаёт первую страницу результатов
         log.debug("=== Search: POST %s ===", action)
         r = self.scraper.post(action, data=post_data)
         r.raise_for_status()
+
         soup = BeautifulSoup(r.text, "lxml")
 
-        # 4) Выдернем из JS search_id для последующих GET-страниц
+        # выдёргиваем из любого <script> search_id, если он есть
         search_id = None
         for script in soup.find_all("script"):
             txt = script.string or ""
-            m = re.search(r"PG_BASE_URL\s*:\s*'[^?]+\?([^']+)'", txt)
+            m = _PG_BASE_URL_RE.search(txt)
             if m:
                 qs = parse_qs(m.group(1))
                 search_id = qs.get("search_id", [None])[0]
+                log.debug("Found search_id=%s", search_id)
                 break
-        if not search_id:
-            raise RuntimeError("Не удалось найти search_id для пагинации")
 
         results: List[TorrentInfo] = []
-        page = 0
         per_page = 50
 
-        while True:
-            # 5) Парсим все строки на этой странице
-            rows = soup.select("tr[data-topic_id]")
-            log.debug("Page %d: found %d rows", page + 1, len(rows))
-            if not rows:
-                break
-
-            for idx, row in enumerate(rows, start=1 + page * per_page):
+        def _parse_page(soup_page, page_offset: int):
+            rows = soup_page.select("tr[data-topic_id]")
+            log.debug("Parsing page offset=%d, rows=%d", page_offset, len(rows))
+            for idx, row in enumerate(rows, start=1 + page_offset):
                 title_a = row.select_one("td.t-title-col a.tLink")
                 if not title_a:
                     continue
                 title = title_a.text.strip()
 
+                # фильтр lossless/lossy
                 is_lossless = bool(_LOSSLESS_RE.search(title))
                 is_lossy    = bool(_LOSSY_RE.search(title))
-
-                # применяем фильтр
                 if only_lossless is True and (not is_lossless or is_lossy):
                     continue
                 if only_lossless is False and is_lossless:
@@ -196,7 +197,6 @@ class RutrackerService:
 
                 seed_tag = row.select_one("b.seedmed")
                 seeders = int(seed_tag.text) if seed_tag and seed_tag.text.isdigit() else 0
-
                 leech_tag = row.select_one("td.leechmed")
                 leechers = int(leech_tag.text) if leech_tag and leech_tag.text.isdigit() else 0
 
@@ -207,21 +207,28 @@ class RutrackerService:
                     seeders=seeders,
                     leechers=leechers,
                 ))
+            return len(rows)
 
-            # 6) Если строк меньше чем на страницу — это была последняя
-            if len(rows) < per_page:
-                break
+        # парсим первую страницу
+        count = _parse_page(soup, page_offset=0)
 
-            # 7) Идём на следующую страницу
-            page += 1
-            offset = page * per_page
-            log.debug("Fetching page %d (start=%d)", page + 1, offset)
-            r = self.scraper.get(
-                search_url,
-                params={"search_id": search_id, "start": offset}
-            )
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml")
+        # если у нас есть search_id *и* ровно per_page записей — делаем пагинацию
+        if search_id and count == per_page:
+            page = 1
+            while True:
+                offset = page * per_page
+                log.debug("Fetching page %d (start=%d)", page + 1, offset)
+                r = self.scraper.get(
+                    search_url,
+                    params={"search_id": search_id, "start": offset}
+                )
+                r.raise_for_status()
+                soup = BeautifulSoup(r.text, "lxml")
+
+                count = _parse_page(soup, page_offset=offset)
+                if count < per_page:
+                    break
+                page += 1
 
         return results
 
@@ -246,5 +253,5 @@ class RutrackerService:
         return await asyncio.to_thread(self._download_sync, topic_id)
 
     async def close(self):
-        # ничего не нужно закрывать
+        # Ничего не нужно чистить
         pass

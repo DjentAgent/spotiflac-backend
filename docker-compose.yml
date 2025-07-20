@@ -4,30 +4,32 @@ services:
   redis:
     image: redis:7-alpine
     container_name: spotiflac_redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
-    # если нужно персистить данные
-    # volumes:
-    #   - redis_data:/data
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   backend:
     build: .
+    image: spotiflac-backend:latest
     container_name: spotiflac_backend
-    command: uvicorn spotiflac_backend.main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - .:/app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0      # жёстко перезаписываем, чтобы не тянуть из .env
     ports:
       - "8000:8000"
-    environment:
-      # подхватываем из .env или из вашей оболочки
-      - RUTRACKER_LOGIN=${RUTRACKER_LOGIN}
-      - RUTRACKER_PASSWORD=${RUTRACKER_PASSWORD}
-      - RUTRACKER_BASE=${RUTRACKER_BASE}
-      - REDIS_URL=redis://redis:6379/0
-      - RUTRACKER_COOKIE_TTL=86400
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    command: uvicorn spotiflac_backend.main:app --host 0.0.0.0 --port 8000
 
-#volumes:
-#  redis_data:
-#    driver: local
+volumes:
+  redis_data:

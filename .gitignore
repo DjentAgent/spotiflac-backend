@@ -1,0 +1,75 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+pip-wheel-metadata/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env/
+.venv/
+venv/
+env/
+env.bak/
+venv.bak/
+
+# Poetry cache (опционально)
+.cache/
+
+# VSCode
+.vscode/
+
+# PyCharm
+.idea/
+*.iml
+
+# mypy
+.mypy_cache/
+.dmypy.json
+
+# pytest
+.pytest_cache/
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+.cache/
+
+# Logs
+*.log
+
+# Environment variables
+.env
+*.env.*
+
+# Docker
+**/docker-compose.override.yml
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
