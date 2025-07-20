@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from typing import List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, parse_qs
 
 import cloudscraper
 import redis
@@ -15,9 +15,8 @@ from spotiflac_backend.models.torrent import TorrentInfo
 
 log = logging.getLogger(__name__)
 
-# ищем lossless‑форматы
+# Регэкспы для фильтра lossless / lossy
 _LOSSLESS_RE = re.compile(r"\b(flac|wavpack|ape|alac)\b", re.IGNORECASE)
-# ищем lossy‑форматы
 _LOSSY_RE    = re.compile(r"\b(mp3|aac|ogg|opus)\b", re.IGNORECASE)
 
 
@@ -31,7 +30,7 @@ class RutrackerService:
         self.redis = redis.Redis.from_url(settings.redis_url)
         self.cookie_ttl = getattr(settings, "rutracker_cookie_ttl", 24 * 3600)
 
-        # Попытаться восстановить cookie‑jar из Redis
+        # Попытка восстановить куки из Redis
         try:
             raw = self.redis.get("rutracker:cookiejar")
             if raw:
@@ -46,10 +45,9 @@ class RutrackerService:
         if jar.get("bb_session") or jar.get("bb_sessionhash"):
             return
 
-        # иначе залогиниться
         self._login_sync()
 
-        # и закешировать куки
+        # Сохраняем новую куку‑банку
         try:
             new_jar = self.scraper.cookies.get_dict()
             self.redis.set(
@@ -105,7 +103,7 @@ class RutrackerService:
         cookies = self.scraper.cookies.get_dict()
         if not (cookies.get("bb_sessionhash") or cookies.get("bb_session")):
             raise RuntimeError("Login failed — bb_session или bb_sessionhash cookie не найдена")
-        log.debug("Login successful, session_cookie=%s", cookies.get("bb_session") or cookies.get("bb_sessionhash"))
+        log.debug("Login successful, session_cookie=%s", cookies.get("bb_sessionhash") or cookies.get("bb_session"))
 
         # follow redirect
         location = post.headers.get("Location")
@@ -122,87 +120,108 @@ class RutrackerService:
         query: str,
         only_lossless: Optional[bool] = None
     ) -> List[TorrentInfo]:
-        """
-        Если only_lossless is True — возвращаем только lossless,
-        если False — только lossy, если None — всё подряд.
-        """
         self._ensure_login()
 
-        # 1) GET формы
         search_url = f"{self.base_url}/forum/tracker.php"
+        # 1) Получаем саму страницу с формой (GET)
         log.debug("=== Search: GET %s?nm=%r ===", search_url, query)
         r = self.scraper.get(search_url, params={"nm": query})
         r.raise_for_status()
 
+        # 2) Собираем POST‑данные из формы
         soup = BeautifulSoup(r.text, "lxml")
         form = soup.find("form", id="tr-form")
         if not form:
             raise RuntimeError("Advanced search form not found on tracker.php")
 
-        # 2) hidden inputs
         action = form["action"]
         if not action.startswith("http"):
             action = f"{self.base_url}/forum/{action.lstrip('/')}"
-        data = {
+        post_data = {
             inp["name"]: inp.get("value", "")
             for inp in form.find_all("input", {"type": "hidden"})
             if inp.has_attr("name")
         }
-        data.update({"nm": query, "f[]": "-1"})
+        post_data.update({"nm": query, "f[]": "-1"})
 
-        # 3) POST
+        # 3) Первый POST – выдаёт первую страницу результатов
         log.debug("=== Search: POST %s ===", action)
-        r = self.scraper.post(action, data=data)
+        r = self.scraper.post(action, data=post_data)
         r.raise_for_status()
-
-        # 4) результат
         soup = BeautifulSoup(r.text, "lxml")
-        rows = soup.select("tr[data-topic_id]")
-        log.debug("Found %d result rows", len(rows))
+
+        # 4) Выдернем из JS search_id для последующих GET-страниц
+        search_id = None
+        for script in soup.find_all("script"):
+            txt = script.string or ""
+            m = re.search(r"PG_BASE_URL\s*:\s*'[^?]+\?([^']+)'", txt)
+            if m:
+                qs = parse_qs(m.group(1))
+                search_id = qs.get("search_id", [None])[0]
+                break
+        if not search_id:
+            raise RuntimeError("Не удалось найти search_id для пагинации")
 
         results: List[TorrentInfo] = []
+        page = 0
+        per_page = 50
 
-        for idx, row in enumerate(rows, start=1):
-            title_a = row.select_one("td.t-title-col a.tLink")
-            if not title_a:
-                continue
-            title = title_a.text.strip()
+        while True:
+            # 5) Парсим все строки на этой странице
+            rows = soup.select("tr[data-topic_id]")
+            log.debug("Page %d: found %d rows", page + 1, len(rows))
+            if not rows:
+                break
 
-            is_lossless = bool(_LOSSLESS_RE.search(title))
-            is_lossy    = bool(_LOSSY_RE.search(title))
+            for idx, row in enumerate(rows, start=1 + page * per_page):
+                title_a = row.select_one("td.t-title-col a.tLink")
+                if not title_a:
+                    continue
+                title = title_a.text.strip()
 
-            # применяем фильтр
-            if only_lossless is True and (not is_lossless or is_lossy):
-                log.debug("Row #%d skip (need lossless): %s", idx, title)
-                continue
-            if only_lossless is False and is_lossless:
-                log.debug("Row #%d skip (need lossy): %s", idx, title)
-                continue
+                is_lossless = bool(_LOSSLESS_RE.search(title))
+                is_lossy    = bool(_LOSSY_RE.search(title))
 
-            a_dl = row.find("a", href=re.compile(r"dl\.php\?t="))
-            if not a_dl:
-                continue
-            torrent_url = urljoin(f"{self.base_url}/forum/", a_dl["href"])
-            size = a_dl.text.strip().replace("\xa0", " ").replace("↓", "").strip()
+                # применяем фильтр
+                if only_lossless is True and (not is_lossless or is_lossy):
+                    continue
+                if only_lossless is False and is_lossless:
+                    continue
 
-            seed_tag = row.select_one("b.seedmed")
-            seeders = int(seed_tag.text) if seed_tag and seed_tag.text.isdigit() else 0
+                a_dl = row.find("a", href=re.compile(r"dl\.php\?t="))
+                if not a_dl:
+                    continue
+                torrent_url = urljoin(f"{self.base_url}/forum/", a_dl["href"])
+                size = a_dl.text.strip().replace("\xa0", " ").replace("↓", "").strip()
 
-            leech_tag = row.select_one("td.leechmed")
-            leechers = int(leech_tag.text) if leech_tag and leech_tag.text.isdigit() else 0
+                seed_tag = row.select_one("b.seedmed")
+                seeders = int(seed_tag.text) if seed_tag and seed_tag.text.isdigit() else 0
 
-            log.debug(
-                "Row #%d: %s -> %s (%s, %d seed, %d leech)",
-                idx, title, torrent_url, size, seeders, leechers
+                leech_tag = row.select_one("td.leechmed")
+                leechers = int(leech_tag.text) if leech_tag and leech_tag.text.isdigit() else 0
+
+                results.append(TorrentInfo(
+                    title=title,
+                    url=torrent_url,
+                    size=size,
+                    seeders=seeders,
+                    leechers=leechers,
+                ))
+
+            # 6) Если строк меньше чем на страницу — это была последняя
+            if len(rows) < per_page:
+                break
+
+            # 7) Идём на следующую страницу
+            page += 1
+            offset = page * per_page
+            log.debug("Fetching page %d (start=%d)", page + 1, offset)
+            r = self.scraper.get(
+                search_url,
+                params={"search_id": search_id, "start": offset}
             )
-
-            results.append(TorrentInfo(
-                title=title,
-                url=torrent_url,
-                size=size,
-                seeders=seeders,
-                leechers=leechers,
-            ))
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "lxml")
 
         return results
 
@@ -227,4 +246,5 @@ class RutrackerService:
         return await asyncio.to_thread(self._download_sync, topic_id)
 
     async def close(self):
+        # ничего не нужно закрывать
         pass
