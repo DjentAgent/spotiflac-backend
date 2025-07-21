@@ -26,22 +26,26 @@ _LOSSLESS_RE = re.compile(
     r")\b",
     re.IGNORECASE
 )
-
 _LOSSY_RE = re.compile(
     r"\b("
       r"mp3|aac|ogg|opus|lossy"
     r")\b",
     re.IGNORECASE
 )
-_PG_BASE_URL_RE  = re.compile(r"PG_BASE_URL\s*:\s*['\"][^?]+\?([^'\"]+)['\"]", re.IGNORECASE)
-_TOTAL_RE        = re.compile(r"Результатов поиска:\s*(\d+)", re.IGNORECASE)
+_PG_BASE_URL_RE = re.compile(
+    r"PG_BASE_URL\s*:\s*['\"][^?]+\?([^'\"]+)['\"]",
+    re.IGNORECASE
+)
+_TOTAL_RE = re.compile(r"Результатов поиска:\s*(\d+)", re.IGNORECASE)
 
 
 def _parse_filelist(torrent_bytes: bytes) -> List[str]:
     meta = bencodepy.decode(torrent_bytes)
     info = meta[b"info"]
+    # single-file
     if b"filename" in info:
         return [info[b"filename"].decode(errors="ignore")]
+    # multi-file
     files = info.get(b"files", [])
     paths = []
     for f in files:
@@ -82,10 +86,16 @@ class RutrackerService:
         jar = self.scraper.cookies.get_dict()
         if jar.get("bb_session") or jar.get("bb_sessionhash"):
             return
+
         self._login_sync()
+
         try:
             new_jar = self.scraper.cookies.get_dict()
-            self.redis.set("rutracker:cookiejar", json.dumps(new_jar), ex=self.cookie_ttl)
+            self.redis.set(
+                "rutracker:cookiejar",
+                json.dumps(new_jar),
+                ex=self.cookie_ttl
+            )
             log.debug("Saved new Rutracker cookies to Redis (ttl=%d)", self.cookie_ttl)
         except Exception:
             log.exception("Failed to save cookies to Redis")
@@ -94,6 +104,7 @@ class RutrackerService:
         login_url = f"{self.base_url}/forum/login.php"
         log.debug("GET %s", login_url)
         resp = self.scraper.get(login_url); resp.raise_for_status()
+
         doc = lxml.html.fromstring(resp.text)
         form = doc.get_element_by_id("login-form-full")
         action = form.action or "login.php"
@@ -111,9 +122,11 @@ class RutrackerService:
             "login_password": settings.rutracker_password,
             "login": form.xpath(".//input[@type='submit']")[0].get("value")
         })
+
         log.debug("POST %s", action)
         post = self.scraper.post(
-            action, data=data,
+            action,
+            data=data,
             headers={"Referer": login_url, "User-Agent": "SpotiFlac/1.0"},
             allow_redirects=False
         )
@@ -122,6 +135,7 @@ class RutrackerService:
         cookies = self.scraper.cookies.get_dict()
         if not (cookies.get("bb_sessionhash") or cookies.get("bb_session")):
             raise RuntimeError("Login failed, session cookie not found")
+
         loc = post.headers.get("Location")
         if loc:
             if not loc.startswith("http"):
@@ -142,7 +156,7 @@ class RutrackerService:
         self._ensure_login()
         search_url = f"{self.base_url}/forum/tracker.php"
 
-        # 1) GET + POST
+        # 1) GET + POST to fetch first page
         r0 = self.scraper.get(search_url, params={"nm": query}); r0.raise_for_status()
         doc0 = lxml.html.fromstring(r0.text)
         form = doc0.get_element_by_id("tr-form")
@@ -165,7 +179,7 @@ class RutrackerService:
         per_page = 50
         pages = ceil(total / per_page) if total else 1
 
-        # search_id
+        # extract search_id
         search_id = None
         for script in doc1.xpath("//script/text()"):
             if m := _PG_BASE_URL_RE.search(script):
@@ -173,26 +187,19 @@ class RutrackerService:
                 search_id = qs.get("search_id", [None])[0]
                 break
 
-        # собрать все результаты
-        parsed: List[Tuple[TorrentInfo,int]] = []
+        # collect parsed entries
+        parsed: List[Tuple[TorrentInfo, int]] = []
 
         def _parse_page(doc, offset: int):
             rows = doc.xpath("//tr[@data-topic_id]")
             for row in rows:
-                # topic_id
                 href = row.xpath(".//a[contains(@href,'dl.php?t=')]/@href")[0]
                 tid = int(parse_qs(urlparse(href).query)["t"][0])
 
-                # forum text (новая проверка!):
-                forum_txt = ""
                 fx = row.xpath(".//td[contains(@class,'f-name-col')]//a/text()")
-                if fx:
-                    forum_txt = fx[0].strip()
+                forum_txt = fx[0].strip() if fx else ""
 
-                # title
                 title = row.xpath(".//td[contains(@class,'t-title-col')]//a/text()")[0].strip()
-
-                # lossless/lossy, теперь по title И по forum_txt
                 combined = f"{forum_txt} {title}"
                 is_l = bool(_LOSSLESS_RE.search(combined))
                 is_y = bool(_LOSSY_RE.search(combined))
@@ -201,8 +208,8 @@ class RutrackerService:
                 if only_lossless is False and is_l:
                     continue
 
-                size = row.xpath(".//a[contains(@href,'dl.php?t=')]/text()")[0].strip()\
-                           .replace("\xa0"," ").replace("↓","").strip()
+                size = row.xpath(".//a[contains(@href,'dl.php?t=')]/text()")[0] \
+                          .strip().replace("\xa0", " ").replace("↓", "").strip()
                 se = int(row.xpath(".//b[contains(@class,'seedmed')]/text()")[0] or 0)
                 le = int(row.xpath(".//td[contains(@class,'leechmed')]/text()")[0] or 0)
 
@@ -215,43 +222,49 @@ class RutrackerService:
                 )
                 parsed.append((ti, tid))
 
-        # первая страница
+        # parse first page
         _parse_page(doc1, 0)
 
-        # последующие — параллельно
+        # parse remaining pages in parallel
         if pages > 1 and search_id:
-            offsets = [i*per_page for i in range(1, pages)]
-            def fetch_parse(off:int):
-                resp = self.scraper.get(search_url, params={
-                    "search_id": search_id, "start": off
-                })
+            offsets = [i * per_page for i in range(1, pages)]
+            def fetch_parse(off: int):
+                resp = self.scraper.get(
+                    search_url, params={"search_id": search_id, "start": off}
+                )
                 resp.raise_for_status()
                 d = lxml.html.fromstring(resp.text)
                 _parse_page(d, off)
+
             with ThreadPoolExecutor(max_workers=min(4, len(offsets))) as ex:
                 ex.map(fetch_parse, offsets)
 
-        # фильтрация по треку (если задан)
+        # if track filtering requested, parallelize torrent downloads + parsing
         if track:
-            filtered = []
-            for ti, tid in parsed:
+            def process_entry(entry: Tuple[TorrentInfo, int]) -> Optional[TorrentInfo]:
+                ti, tid = entry
                 key = f"tracklist:{tid}"
-                if (raw := self.redis.get(key)):
-                    fl = json.loads(raw)
+                if (raw_list := self.redis.get(key)):
+                    fl = json.loads(raw_list)
                 else:
                     data = self._download_sync(tid)
                     fl = _parse_filelist(data)
                     self.redis.set(key, json.dumps(fl), ex=3600)
-                if _contains_track(fl, track):
-                    filtered.append(ti)
+                return ti if _contains_track(fl, track) else None
+
+            filtered: List[TorrentInfo] = []
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                for result in ex.map(process_entry, parsed):
+                    if result:
+                        filtered.append(result)
             results = filtered
         else:
             results = [ti for ti, _ in parsed]
 
-        # кешируем результаты на 5 мин
+        # cache the final results for 5 minutes
         to_cache = [
-            {"title":r.title, "url":r.url, "size":r.size,
-             "seeders":r.seeders, "leechers":r.leechers}
+            {"title": r.title, "url": r.url, "size": r.size,
+             "seeders": r.seeders, "leechers": r.leechers}
             for r in results
         ]
         self.redis.set(cache_key, json.dumps(to_cache), ex=300)
@@ -278,4 +291,5 @@ class RutrackerService:
         return await asyncio.to_thread(self._download_sync, topic_id)
 
     async def close(self):
+        # no resources to clean up
         pass
