@@ -14,6 +14,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - spotiflac_net
 
   backend:
     build: .
@@ -23,13 +25,19 @@ services:
     env_file:
       - .env
     environment:
-      REDIS_URL: redis://redis:6379/0      # жёстко перезаписываем, чтобы не тянуть из .env
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
     depends_on:
       redis:
         condition: service_healthy
     command: uvicorn spotiflac_backend.main:app --host 0.0.0.0 --port 8000
+    networks:
+      - spotiflac_net
 
 volumes:
   redis_data:
+
+networks:
+  spotiflac_net:
+    external: true
