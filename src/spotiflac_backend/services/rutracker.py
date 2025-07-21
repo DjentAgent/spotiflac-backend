@@ -6,13 +6,12 @@ import re
 from math import ceil
 from typing import List, Optional, Tuple
 from urllib.parse import urljoin, parse_qs, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import bencodepy
 import cloudscraper
 import redis
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor
-from rapidfuzz import fuzz
 
 from spotiflac_backend.core.config import settings
 from spotiflac_backend.models.torrent import TorrentInfo
@@ -27,11 +26,13 @@ _TOTAL_RE        = re.compile(r"Результатов поиска:\s*(\d+)", r
 
 
 def _parse_filelist(torrent_bytes: bytes) -> List[str]:
-    """ Распаковывает .torrent и возвращает список путей файлов внутри раздачи. """
+    """Распаковывает .torrent и возвращает список путей файлов внутри раздачи."""
     meta = bencodepy.decode(torrent_bytes)
     info = meta[b"info"]
+    # single-file
     if b"filename" in info:
         return [info[b"filename"].decode(errors="ignore")]
+    # multi-file
     files = info.get(b"files", [])
     paths: List[str] = []
     for f in files:
@@ -41,16 +42,11 @@ def _parse_filelist(torrent_bytes: bytes) -> List[str]:
 
 
 def _contains_track(filelist: List[str], track: str) -> bool:
-    """
-    Проверяет, встречается ли трек track в любом из путей filelist,
-    сначала простым вхождением, потом фаззимчингом.
-    """
+    """Проверяет, встречается ли трек track в любом из путей filelist."""
     t = track.lower()
     for fname in filelist:
         fl = fname.lower()
         if t in fl:
-            return True
-        if fuzz.partial_ratio(t, fl) >= 80:
             return True
     return False
 
@@ -95,24 +91,24 @@ class RutrackerService:
         soup = BeautifulSoup(resp.text, "lxml")
         form = soup.find("form", id="login-form-full")
         if not form:
-            snippet = resp.text[:200].replace("\n","")
+            snippet = resp.text[:200].replace("\n", "")
             raise RuntimeError(f"Login form not found, snippet: {snippet!r}")
 
-        action = form.get("action","login.php")
+        action = form.get("action", "login.php")
         if not action.startswith("http"):
             action = f"{self.base_url}/forum/{action.lstrip('/')}?login_try=Y"
 
         data = {
-            inp["name"]: inp.get("value","")
-            for inp in form.find_all("input",{"type":"hidden"})
+            inp["name"]: inp.get("value", "")
+            for inp in form.find_all("input", {"type": "hidden"})
             if inp.has_attr("name")
         }
         data.update({
             "login_username": settings.rutracker_login,
             "login_password": settings.rutracker_password,
-            "login": form.find("input",{"type":"submit"})["value"],
+            "login": form.find("input", {"type": "submit"})["value"],
         })
-        headers = {"Referer": login_url, "User-Agent":"SpotiFlac/1.0"}
+        headers = {"Referer": login_url, "User-Agent": "SpotiFlac/1.0"}
 
         log.debug("=== Login: POST %s ===", action)
         post = self.scraper.post(action, data=data, headers=headers, allow_redirects=False)
@@ -132,16 +128,21 @@ class RutrackerService:
             final = self.scraper.get(location); final.raise_for_status()
             log.debug("Final GET after login status: %s", final.status_code)
 
+    def _download_sync(self, topic_id: int) -> bytes:
+        self._ensure_login()
+        dl_url = f"{self.base_url}/forum/dl.php?t={topic_id}"
+        log.debug("Downloading torrent %s", dl_url)
+        resp = self.scraper.get(dl_url, allow_redirects=True)
+        resp.raise_for_status()
+        return resp.content
+
     def _search_sync(
         self,
         query: str,
         only_lossless: Optional[bool] = None,
         track: Optional[str] = None
     ) -> List[TorrentInfo]:
-        """
-        Поиск раздач. Если track задан — дополнительно фильтруем по наличию этого трека
-        внутри файлов раздачи. Результаты кешируем на 5 минут.
-        """
+        # 1) кеш поиска
         cache_key = f"search:{query}:{only_lossless}:{track}"
         raw = self.redis.get(cache_key)
         if raw:
@@ -152,7 +153,7 @@ class RutrackerService:
         self._ensure_login()
         search_url = f"{self.base_url}/forum/tracker.php"
 
-        # --- 1) GET-POST первая страница ---
+        # 2) GET+POST первой страницы
         log.debug("=== Search: GET %s?nm=%r ===", search_url, query)
         r0 = self.scraper.get(search_url, params={"nm": query}); r0.raise_for_status()
         soup0 = BeautifulSoup(r0.text, "lxml")
@@ -165,16 +166,16 @@ class RutrackerService:
             action = f"{self.base_url}/forum/{action.lstrip('/')}"
 
         post_data = {
-            inp["name"]: inp.get("value","")
-            for inp in form.find_all("input",{"type":"hidden"})
+            inp["name"]: inp.get("value", "")
+            for inp in form.find_all("input", {"type": "hidden"})
             if inp.has_attr("name")
         }
-        post_data.update({"nm": query, "f[]":"-1"})
+        post_data.update({"nm": query, "f[]": "-1"})
         log.debug("=== Search: POST %s ===", action)
         r1 = self.scraper.post(action, data=post_data); r1.raise_for_status()
         soup1 = BeautifulSoup(r1.text, "lxml")
 
-        # total и пагинация
+        # 3) total + пагинация
         txt = soup1.get_text()
         m_tot = _TOTAL_RE.search(txt)
         total = int(m_tot.group(1)) if m_tot else 0
@@ -187,79 +188,82 @@ class RutrackerService:
             m = _PG_BASE_URL_RE.search(s)
             if m:
                 qs = parse_qs(m.group(1))
-                search_id = qs.get("search_id",[None])[0]
+                search_id = qs.get("search_id", [None])[0]
                 log.debug("Found search_id=%s", search_id)
                 break
 
-        # парсинг всех страниц
-        parsed: List[Tuple[TorrentInfo,int]] = []
-        def _parse_page(soup_page, offset:int):
+        # 4) парсинг всех страниц (собираем пары (TorrentInfo, topic_id))
+        parsed: List[Tuple[TorrentInfo, int]] = []
+
+        def _parse_page(soup_page, offset: int):
             rows = soup_page.select("tr[data-topic_id]")
             log.debug("Parsing page offset=%d, rows=%d", offset, len(rows))
             for row in rows:
-                href = row.find("a",href=re.compile(r"dl\.php\?t="))["href"]
+                href = row.find("a", href=re.compile(r"dl\.php\?t="))["href"]
                 tid = int(parse_qs(urlparse(href).query)["t"][0])
                 title = row.select_one("td.t-title-col a.tLink").text.strip()
+
                 is_l = bool(_LOSSLESS_RE.search(title))
                 is_y = bool(_LOSSY_RE.search(title))
-                if only_lossless is True and (not is_l or is_y): continue
-                if only_lossless is False and is_l: continue
+                if only_lossless is True and (not is_l or is_y):
+                    continue
+                if only_lossless is False and is_l:
+                    continue
 
                 ti = TorrentInfo(
                     title=title,
                     url=urljoin(f"{self.base_url}/forum/", href),
-                    size=row.find("a",href=re.compile(r"dl\.php\?t=")).text
-                         .strip().replace("\xa0"," ").replace("↓","").strip(),
+                    size=row.find("a", href=re.compile(r"dl\.php\?t=")).text
+                        .strip().replace("\xa0", " ").replace("↓", "").strip(),
                     seeders=int(row.select_one("b.seedmed").text or 0),
                     leechers=int(row.select_one("td.leechmed").text or 0),
                 )
                 parsed.append((ti, tid))
 
+        # первая страница
         _parse_page(soup1, 0)
 
+        # остальные страницы
         if pages > 1 and search_id:
-            offsets = [i*per_page for i in range(1, pages)]
-            with ThreadPoolExecutor(max_workers=min(4, len(offsets))) as ex:
-                for _ in ex.map(
-                    lambda off: self.scraper.get(search_url, params={"search_id":search_id,"start":off}),
-                    offsets
-                ):
-                    # map возвращает ответ, но нам нужно распарсить
-                    pass
-                # (ниже чуть упростили: для каждого off нужно получить soup и _parse_page;
-                # вы можете заменить этот блок на полный executor.map с fetch+parse)
-
-            # на самом деле лучше так:
-            def fetch_parse(off:int):
-                resp = self.scraper.get(search_url, params={"search_id":search_id,"start":off})
+            offsets = [i * per_page for i in range(1, pages)]
+            for off in offsets:
+                resp = self.scraper.get(search_url, params={"search_id": search_id, "start": off})
                 resp.raise_for_status()
-                sp = BeautifulSoup(resp.text, "lxml")
-                _parse_page(sp, off)
-            with ThreadPoolExecutor(max_workers=min(4, len(offsets))) as ex:
-                ex.map(fetch_parse, offsets)
+                soup = BeautifulSoup(resp.text, "lxml")
+                _parse_page(soup, off)
 
-        # фильтрация по треку
-        if track:
-            filtered: List[TorrentInfo] = []
-            for ti, tid in parsed:
-                key = f"tracklist:{tid}"
-                raw_list = self.redis.get(key)
-                if raw_list:
-                    fl = json.loads(raw_list)
-                else:
-                    data = self._download_sync(tid)
-                    fl = _parse_filelist(data)
-                    self.redis.set(key, json.dumps(fl), ex=3600)
-                if _contains_track(fl, track):
-                    filtered.append(ti)
-            results = filtered
-        else:
+        # 5) если не нужно искать внутри .torrent — возвращаем сразу
+        if not track:
             results = [ti for ti, _ in parsed]
+        else:
+            # 6) параллельный fetch+parse .torrent
+            filtered: List[TorrentInfo] = []
 
-        # кешируем выдачу
+            def fetch_and_parse(tid: int) -> Tuple[int, List[str]]:
+                data = self._download_sync(tid)
+                return tid, _parse_filelist(data)
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_ti = {
+                    executor.submit(fetch_and_parse, tid): ti
+                    for ti, tid in parsed
+                }
+                for fut in as_completed(future_to_ti):
+                    ti = future_to_ti[fut]
+                    try:
+                        tid, filelist = fut.result()
+                    except Exception as e:
+                        log.error("Error fetching/parsing torrent %s: %s", ti.url, e)
+                        continue
+                    if _contains_track(filelist, track):
+                        filtered.append(ti)
+
+            results = filtered
+
+        # 7) кешируем выдачу на 5 минут
         to_cache = [
-            {"title":r.title, "url":r.url, "size":r.size,
-             "seeders":r.seeders, "leechers":r.leechers}
+            {"title": r.title, "url": r.url, "size": r.size,
+             "seeders": r.seeders, "leechers": r.leechers}
             for r in results
         ]
         self.redis.set(cache_key, json.dumps(to_cache), ex=300)
@@ -275,17 +279,10 @@ class RutrackerService:
         import asyncio
         return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
 
-    def _download_sync(self, topic_id: int) -> bytes:
-        self._ensure_login()
-        dl_url = f"{self.base_url}/forum/dl.php?t={topic_id}"
-        log.debug("Downloading torrent %s", dl_url)
-        resp = self.scraper.get(dl_url, allow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
-
     async def download(self, topic_id: int) -> bytes:
         import asyncio
         return await asyncio.to_thread(self._download_sync, topic_id)
 
     async def close(self):
+        # Ничего не нужно чистить
         pass
