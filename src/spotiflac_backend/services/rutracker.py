@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from math import ceil
 from typing import List, Optional, Tuple
 from urllib.parse import urljoin, parse_qs, urlparse
@@ -102,19 +103,22 @@ class RutrackerService:
         raise CaptchaRequired(session_id, img_url)
 
     def complete_login(self, session_id: str, solution: str):
+        """
+        Завершает вход капчей и гарантирует, что мы действительно залогинены.
+        """
         log.debug("→ [complete_login] session_id=%s, solution=%s", session_id, solution)
         raw = self.redis.get(f"login:{session_id}")
         if not raw:
             log.error("→ [complete_login] No Redis entry for session %s", session_id)
             raise RuntimeError("Invalid or expired captcha session")
         info = json.loads(raw)
+
         hidden = info["hidden"]
         sid = hidden.get("cap_sid")
         code_field = info["code_field"]
         submit_val = info["submit_val"]
-        log.debug("→ [complete_login] sid=%s, code_field=%s, submit_val=%s", sid, code_field, submit_val)
 
-        # готовим данные для POST
+        # 1) Собираем POST‑дату
         data = hidden.copy()
         data.update({
             "login_username": settings.rutracker_login,
@@ -123,26 +127,46 @@ class RutrackerService:
             code_field: solution,
             "login": submit_val,
         })
-        log.debug("→ [complete_login] POST data keys: %s", list(data.keys()))
-
         login_url = f"{self.base_url}/forum/login.php"
         log.debug("→ [complete_login] POST %s", login_url)
-        post = self.scraper.post(login_url, data=data, headers={"Referer": login_url})
-        log.debug("→ [complete_login] Response status: %s", post.status_code)
-        snippet = post.text[:200].replace("\n", " ")
-        log.debug("→ [complete_login] Response text snippet: %s", snippet)
 
-        post.raise_for_status()
+        # 2) Отправляем и не следуем сразу за редиректом
+        resp = self.scraper.post(
+            login_url,
+            data=data,
+            headers={"Referer": login_url},
+            allow_redirects=False
+        )
+        log.debug("→ [complete_login] POST status: %s", resp.status_code)
 
+        # Если нас редиректят — берём URL из Location
+        loc = resp.headers.get("Location")
+        if loc and resp.status_code in (301, 302, 303):
+            next_url = urljoin(self.base_url + "/forum/", loc)
+            log.debug("→ [complete_login] Following redirect to %s", next_url)
+            resp2 = self.scraper.get(next_url)
+            resp2.raise_for_status()
+        else:
+            resp.raise_for_status()
+
+        # 3) Обязательно прогоняем GET по трекеру, чтобы все куки точно установились
+        tracker_url = f"{self.base_url}/forum/tracker.php"
+        log.debug("→ [complete_login] Finalizing session with GET %s", tracker_url)
+        final = self.scraper.get(tracker_url)
+        final.raise_for_status()
+
+        # 4) Проверяем наличие хотя бы bb_session
         jar = self.scraper.cookies.get_dict()
-        log.debug("→ [complete_login] Cookies after POST: %s", jar)
-        if not (jar.get("bb_session") or jar.get("bb_sessionhash")):
+        log.debug("→ [complete_login] Cookies after finalize: %s", jar)
+        if not jar.get("bb_session"):
             log.error("→ [complete_login] LOGIN_AFTER_CAPTCHA failed, cookies: %s", jar)
             raise RuntimeError("Login failed after captcha")
 
-        # сохраняем новые куки
+        # 5) Сохраняем в Redis
         self.redis.set("rutracker:cookiejar", json.dumps(jar), ex=self.cookie_ttl)
-        log.debug("→ [complete_login] CAPTCHA login succeeded; session cookie saved")
+        log.debug("→ [complete_login] CAPTCHA login succeeded; cookies saved")
+
+
 
 
     def _login_sync(self):
@@ -167,13 +191,20 @@ class RutrackerService:
         self.redis.set("rutracker:cookiejar", json.dumps(jar), ex=self.cookie_ttl)
 
     def _ensure_login(self):
+        """
+        Гарантирует, что есть живая сессия. Если нет — сначала обычный логин,
+        а при отсутствии куки bb_session — инициирует CAPTCHA.
+        """
         jar = self.scraper.cookies.get_dict()
-        if jar.get("bb_session") or jar.get("bb_sessionhash"):
+        if jar.get("bb_session"):
             return
+
         try:
+            # пробуем без капчи
             self._login_sync()
         except RuntimeError as e:
-            if str(e)=="LOGIN_NO_SESSION":
+            if str(e) == "LOGIN_NO_SESSION":
+                # нет сессии — жёстко падаем в CAPTCHA
                 self.initiate_login()
             else:
                 raise
@@ -197,81 +228,77 @@ class RutrackerService:
         if raw := self.redis.get(cache_key):
             return [TorrentInfo(**d) for d in json.loads(raw)]
 
-        # Убедиться, что залогинились или получить капчу
+        # 1) Убедиться в логине/инициировать капчу
         self._ensure_login()
 
-        # Шаг 1: получить форму поиска
         search_url = f"{self.base_url}/forum/tracker.php"
-        r0 = self.scraper.get(search_url, params={"nm": query});
+        # 2) GET чтобы получить form_token
+        r0 = self.scraper.get(search_url, params={"nm": query})
         r0.raise_for_status()
-        doc0 = lxml.html.fromstring(r0.text)
-        forms = doc0.xpath("//form[@id='tr-form']")
-        if not forms:
-            raise RuntimeError("Search form not found; login might have failed")
-        form = forms[0]
+        token = self._extract_form_token(r0.text)
 
-        # Шаг 2: отправить запрос поиска
-        action = form.get("action") or search_url
-        if not action.startswith("http"):
-            action = f"{self.base_url}/forum/{action.lstrip('/')}"
-        post_data = {
-            inp.get("name"): inp.get("value", "")
-            for inp in form.xpath(".//input[@type='hidden']")
-            if inp.get("name")
-        }
-        post_data.update({"nm": query, "f[]": "-1"})
-        r1 = self.scraper.post(action, data=post_data);
+        # 3) POST запрос
+        post_data = {"nm": query, "f[]": "-1"}
+        if token:
+            post_data["form_token"] = token
+        r1 = self.scraper.post(search_url, data=post_data)
         r1.raise_for_status()
         doc1 = lxml.html.fromstring(r1.text)
 
-        # Шаг 3: подсчитать страницы
+        # 4) Считаем страницы
         total = int(_TOTAL_RE.search(doc1.text_content()).group(1)) if _TOTAL_RE.search(doc1.text_content()) else 0
         per_page = 50
         pages = ceil(total / per_page) if total else 1
 
-        # Шаг 4: найти search_id для пагинации
-        parsed: List[Tuple[TorrentInfo, int]] = []
+        # 5) Ищем search_id
         search_id = None
         for script in doc1.xpath("//script/text()"):
             if m := _PG_BASE_URL_RE.search(script):
                 search_id = parse_qs(m.group(1)).get("search_id", [None])[0]
                 break
 
-        # Вспомогательная функция для парсинга одной страницы
-        def parse_page(doc):
-            for row in doc.xpath("//tr[@data-topic_id]"):
-                hrefs = row.xpath(".//a[contains(@href,'dl.php?t=')]/@href")
-                if not hrefs:
-                    continue
-                href = hrefs[0]
-                tid = int(parse_qs(urlparse(href).query)["t"][0])
+        parsed: List[Tuple[TorrentInfo, int]] = []
 
-                titles = row.xpath(".//td[contains(@class,'t-title-col')]//a/text()")
-                if not titles:
-                    continue
-                title = titles[0].strip()
+        # 6) Разбор одной страницы
+        def _parse_page(doc):
+            for row in doc.xpath("//table[@id='tor-tbl']//tr[@data-topic_id]"):
+                tid = int(row.get("data-topic_id"))
 
-                is_l = bool(_LOSSLESS_RE.search(title))
-                is_y = bool(_LOSSY_RE.search(title))
+                # forum + title
+                forum = row.xpath(".//td[contains(@class,'f-name-col')]//a/text()")
+                title = row.xpath(".//td[contains(@class,'t-title-col')]//a/text()")
+                if not title:
+                    continue
+                forum_txt = forum[0].strip() if forum else ""
+                title_txt = title[0].strip()
+                combined = f"{forum_txt} {title_txt}".strip()
+
+                # lossless/lossy
+                is_l = bool(_LOSSLESS_RE.search(combined))
+                is_y = bool(_LOSSY_RE.search(combined))
                 if only_lossless is True and (not is_l or is_y):
                     continue
                 if only_lossless is False and is_l:
                     continue
 
-                sizes = row.xpath(".//a[contains(@href,'dl.php?t=')]/text()")
-                if not sizes:
-                    continue
-                size = sizes[0].strip()
+                # size
+                size_el = row.xpath(".//td[contains(@class,'tor-size')]//a/text()")
+                size = size_el[0].strip() if size_el else ""
 
-                seeders_txt = row.xpath(".//b[contains(@class,'seedmed')]/text()")
-                leechers_txt = row.xpath(".//td[contains(@class,'leechmed')]/text()")
-                se = int(seeders_txt[0] or 0) if seeders_txt else 0
-                le = int(leechers_txt[0] or 0) if leechers_txt else 0
+                # seeders
+                st = row.xpath(".//b[contains(@class,'seedmed')]/text()")
+                st0 = st[0].strip() if st else "0"
+                se = int(st0) if st0.isdigit() else 0
+                # leechers
+                lt = row.xpath(".//td[contains(@class,'leechmed')]/text()")
+                lt0 = lt[0].strip() if lt else "0"
+                le = int(lt0) if lt0.isdigit() else 0
 
                 parsed.append((
                     TorrentInfo(
-                        title=title,
-                        url=urljoin(self.base_url + "/forum/", href),
+                        # сохраняем forum+title в title
+                        title=combined,
+                        url=urljoin(self.base_url + "/forum/", row.xpath(".//a[contains(@href,'dl.php?t=')]/@href")[0]),
                         size=size,
                         seeders=se,
                         leechers=le
@@ -279,62 +306,61 @@ class RutrackerService:
                     tid
                 ))
 
-        # Парсим первую страницу
-        parse_page(doc1)
-        # Парсим остальные, если есть
+        # 7) Первый проход
+        _parse_page(doc1)
+
+        # 8) Остальные страницы
         if pages > 1 and search_id:
-            for off in range(1, pages):
-                resp = self.scraper.get(search_url, params={"search_id": search_id, "start": off * per_page})
+            offsets = [i * per_page for i in range(1, pages)]
+            def fetch(off):
+                resp = self.scraper.get(search_url, params={"search_id": search_id, "start": off})
                 resp.raise_for_status()
-                parse_page(lxml.html.fromstring(resp.text))
+                _parse_page(lxml.html.fromstring(resp.text))
 
-        # Фильтрация по имени трека
+            with ThreadPoolExecutor(max_workers=min(4, len(offsets))) as ex:
+                ex.map(fetch, offsets)
+
+        # 9) Фильтрация по треку (в title уже есть forum+title)
         if track:
-            results: List[TorrentInfo] = []
-            for ti, tid in parsed:
-                cache2 = f"tracklist:{tid}"
-                if raw2 := self.redis.get(cache2):
-                    fl = json.loads(raw2)
-                else:
-                    # при загрузке могло потребоваться капча
-                    try:
-                        torrent_bytes = self._download_sync(tid)
-                    except CaptchaRequired:
-                        raise
-                    except Exception as e:
-                        log.warning("Skipping %s: download/parsing error %s", tid, e)
-                        continue
-
-                    try:
-                        fl = self._parse_filelist(torrent_bytes)
-                    except Exception as e:
-                        log.warning("Skipping %s: bencode parse error %s", tid, e)
-                        continue
-
-                    self.redis.set(cache2, json.dumps(fl), ex=3600)
-
-                if self._contains_track(fl, track):
-                    results.append(ti)
+            t = track.lower()
+            results = [ti for ti, _ in parsed if t in ti.title.lower()]
         else:
             results = [ti for ti, _ in parsed]
 
-        # Кэшируем и возвращаем
-        out = [
-            {"title": r.title, "url": r.url, "size": r.size, "seeders": r.seeders, "leechers": r.leechers}
-            for r in results
-        ]
-        self.redis.set(cache_key, json.dumps(out), ex=300)
+        # 10) Кэшируем и возвращаем
+        to_cache = [{
+            "title": r.title, "url": r.url,
+            "size": r.size, "seeders": r.seeders, "leechers": r.leechers
+        } for r in results]
+        self.redis.set(cache_key, json.dumps(to_cache), ex=300)
         return results
+
+
+
+
 
     async def search(self,query,only_lossless=None,track=None):
         import asyncio
         return await asyncio.to_thread(self._search_sync,query,only_lossless,track)
 
-    def _download_sync(self,topic_id:int)->bytes:
+    def _download_sync(self, topic_id: int) -> bytes:
+        """
+        Скачиваем .torrent, даем cloudflare‑редиректу пройти (allow_redirects=True),
+        и только если контент не .torrent — считаем, что нужна капча.
+        """
         self._ensure_login()
-        url=f"{self.base_url}/forum/dl.php?t={topic_id}"
-        r=self.scraper.get(url,allow_redirects=True); r.raise_for_status()
-        return r.content
+        dl_url = f"{self.base_url}/forum/dl.php?t={topic_id}"
+        log.debug("→ [download] GET %s (with redirects)", dl_url)
+        resp = self.scraper.get(dl_url, allow_redirects=True)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("Content-Type", "")
+        # реальный .torrent обычно application/x-bittorrent
+        if "text/html" in content_type:
+            log.warning("→ [download] HTML received instead of .torrent, need captcha for topic %s", topic_id)
+            raise CaptchaRequired(session_id=uuid.uuid4().hex,
+                                  img_url=f"{self.base_url}/forum/login.php")
+        return resp.content
 
     async def download(self,topic_id:int):
         import asyncio
