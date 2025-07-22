@@ -200,43 +200,47 @@ class RutrackerService:
 
     def _search_sync(self, query: str, only_lossless: Optional[bool], track: Optional[str]) -> List[TorrentInfo]:
         cache_key = f"search:{query}:{only_lossless}:{track}"
+
+        # 0) Всегда убеждаемся, что у нас валидная сессия
+        self._ensure_login()
+
+        # 1) Попробовать получить из кеша
         if raw := self.redis.get(cache_key):
             return [TorrentInfo(**d) for d in json.loads(raw)]
 
-        self._ensure_login()
         search_url = f"{self.base_url}/forum/tracker.php"
 
-        # GET + POST первой страницы
-        r0 = self.scraper.get(search_url, params={"nm": query}); r0.raise_for_status()
+        # 2) GET + POST первой страницы
+        r0 = self.scraper.get(search_url, params={"nm": query})
+        r0.raise_for_status()
         token = self._extract_form_token(r0.text)
         post_data = {"nm": query, "f[]": "-1"}
         if token:
             post_data["form_token"] = token
-        r1 = self.scraper.post(search_url, data=post_data); r1.raise_for_status()
+        r1 = self.scraper.post(search_url, data=post_data)
+        r1.raise_for_status()
         doc1 = lxml.html.fromstring(r1.text)
 
-        # сколько страниц
-        total = int(_TOTAL_RE.search(doc1.text_content()).group(1) or 0)
+        # 3) Подсчёт страниц
+        text = doc1.text_content()
+        total = int(_TOTAL_RE.search(text).group(1)) if _TOTAL_RE.search(text) else 0
         per_page = 50
         pages = ceil(total / per_page) if total else 1
 
-        # вытащить search_id
+        # 4) Извлечь search_id
         search_id = None
         for script in doc1.xpath("//script/text()"):
             if m := _PG_BASE_URL_RE.search(script):
                 search_id = parse_qs(m.group(1)).get("search_id", [None])[0]
                 break
 
-        parsed: List[Tuple[TorrentInfo,int]] = []
+        parsed: List[Tuple[TorrentInfo, int]] = []
 
         def _parse_page(doc):
             for row in doc.xpath("//table[@id='tor-tbl']//tr[@data-topic_id]"):
                 tid = int(row.get("data-topic_id"))
-                forum = row.xpath(".//td[contains(@class,'f-name-col')]//a/text()")
-                title = row.xpath(".//td[contains(@class,'t-title-col')]//a/text()")
-                if not title:
-                    continue
-                forum_txt, title_txt = (forum[0].strip() if forum else "", title[0].strip())
+                forum_txt = (row.xpath(".//td[contains(@class,'f-name-col')]//a/text()") or [""])[0].strip()
+                title_txt = (row.xpath(".//td[contains(@class,'t-title-col')]//a/text()") or [""])[0].strip()
                 combined = f"{forum_txt} {title_txt}".strip()
 
                 # фильтр lossless/lossy
@@ -245,36 +249,35 @@ class RutrackerService:
                 if only_lossless is True and (not is_l or is_y): continue
                 if only_lossless is False and is_l: continue
 
-                size_el = row.xpath(".//td[contains(@class,'tor-size')]//a/text()")
-                size = size_el[0].strip() if size_el else ""
-
-                st = row.xpath(".//b[contains(@class,'seedmed')]/text()")
-                se = int(st[0].strip()) if st and st[0].strip().isdigit() else 0
-                lt = row.xpath(".//td[contains(@class,'leechmed')]/text()")
-                le = int(lt[0].strip()) if lt and lt[0].strip().isdigit() else 0
+                size = (row.xpath(".//td[contains(@class,'tor-size')]//a/text()") or [""])[0].strip()
+                se = int((row.xpath(".//b[contains(@class,'seedmed')]/text()") or ["0"])[0].strip())
+                le = int((row.xpath(".//td[contains(@class,'leechmed')]/text()") or ["0"])[0].strip())
 
                 url = urljoin(self.base_url + "/forum/",
                               row.xpath(".//a[contains(@href,'dl.php?t=')]/@href")[0])
                 ti = TorrentInfo(title=combined, url=url, size=size, seeders=se, leechers=le)
                 parsed.append((ti, tid))
 
-        # первый проход
+        # 5) Парсим первую страницу
         _parse_page(doc1)
 
-        # остальные страницы параллельно (с запасом по капче)
+        # 6) Парсим остальные страницы, если есть
         if pages > 1 and search_id:
             offsets = [i * per_page for i in range(1, pages)]
             with ThreadPoolExecutor(max_workers=min(4, len(offsets))) as ex:
-                for off in offsets:
-                    resp = self.scraper.get(search_url, params={"search_id": search_id, "start": off})
+                def fetch_and_parse(off: int):
+                    resp = self.scraper.get(search_url,
+                                            params={"search_id": search_id, "start": off})
                     resp.raise_for_status()
                     _parse_page(lxml.html.fromstring(resp.text))
 
-        # фильтрация по треку
+                ex.map(fetch_and_parse, offsets)
+
+        # 7) Фильтрация по треку (при необходимости)
         if track:
             results: List[TorrentInfo] = []
             t_low = track.lower()
-            for ti, tid in parsed[:50]:  # ограничим 50 первых, например
+            for ti, tid in parsed[:50]:
                 if t_low in ti.title.lower():
                     results.append(ti)
                     continue
@@ -282,47 +285,40 @@ class RutrackerService:
                     files = self._get_filelist(tid)
                 except CaptchaRequired:
                     continue
-                if self._contains_track(files, track):
+                if any(t_low in f.lower() for f in files):
                     results.append(ti)
             final = results
         else:
             final = [ti for ti, _ in parsed]
 
-        # кешируем финальный результат
-        to_cache = [
-            {"title": r.title, "url": r.url, "size": r.size, "seeders": r.seeders, "leechers": r.leechers}
-            for r in final
-        ]
+        # 8) Кешируем и возвращаем
+        to_cache = [{"title": r.title, "url": r.url, "size": r.size,
+                     "seeders": r.seeders, "leechers": r.leechers}
+                    for r in final]
         self.redis.set(cache_key, json.dumps(to_cache), ex=self.search_ttl)
         return final
 
     async def search(self, query, only_lossless=None, track=None):
         import asyncio
 
-        async def _attempt():
+        async def _run():
             return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
 
         try:
-            # первая попытка
-            return await _attempt()
+            return await _run()
         except Exception as e:
             msg = str(e)
-            # если это ошибка «нет формы tr-form» или «не нашли сессионную куку»
-            if "'tr-form'" in msg or "Login failed, session cookie not found" in msg:
-                log.warning("Session lost or page structure changed (%s), повторный логин...", msg)
-                # 1) Очистить куки локально
+            # при ошибках авторизации или разметки — сбрасываем сессию и повторяем
+            if "'tr-form'" in msg or "Login failed" in msg or "LOGIN_NO_SESSION" in msg:
+                log.warning("Session lost (%s), пересоздаём и повторяем поиск...", msg)
+                # очистить куки в cloudscraper
                 self.scraper.cookies.clear()
-                # 2) Удалить сохранённые в Redis
+                # удалить из Redis
                 self.redis.delete("rutracker:cookiejar")
-                # 3) Заново залогиниться (с капчей, если потребуется)
-                try:
-                    self._ensure_login()
-                except CaptchaRequired as cap:
-                    # если потребуется капча — пробросить её клиенту
-                    raise
-                # 4) Повторить поиск
-                return await _attempt()
-            # если любая другая ошибка — пробрасываем
+                # новая авторизация (может поднять CaptchaRequired)
+                self._ensure_login()
+                # повтор
+                return await _run()
             raise
 
     def _download_sync(self, topic_id: int) -> bytes:
