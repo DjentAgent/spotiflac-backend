@@ -61,67 +61,28 @@ class RutrackerService:
         return m.group(1) if m else ""
 
     def _login_sync(self):
-        """
-        Синхронный вход в Rutracker без капчи.
-        берёт action из формы (с login_try=Y), POST и обрабатывает 302,
-        затем сохраняет bb_session в Redis.
-        """
-        login_url = f"{self.base_url}/forum/login.php"
-        # 1) GET формы
-        resp = self.scraper.get(login_url)
-        resp.raise_for_status()
-        html = resp.text
-
-        # 2) Извлекаем form_token
-        token = self._extract_form_token(html)
-        doc = lxml.html.fromstring(html)
-
-        # 3) Находим саму форму и собираем скрытые поля
+        url = f"{self.base_url}/forum/login.php"
+        r = self.scraper.get(url); r.raise_for_status()
+        token = self._extract_form_token(r.text)
+        doc = lxml.html.fromstring(r.text)
         form = doc.get_element_by_id("login-form-full")
-        action = form.action or "login.php"
-        if not action.startswith("http"):
-            action = urljoin(self.base_url + "/forum/", action)
-        data = {
-            inp.get("name"): inp.get("value", "")
-            for inp in form.xpath(".//input[@type='hidden']")
-            if inp.get("name")
-        }
+        data = {i.get("name"): i.get("value","") for i in form.xpath(".//input[@type='hidden']") if i.get("name")}
         if token:
             data["form_token"] = token
-
-        # 4) Подставляем логин/пароль и значение кнопки
-        submit_val = form.xpath(".//input[@type='submit']/@value")[0]
+        sv = form.xpath(".//input[@type='submit']/@value")[0]
         data.update({
             "login_username": settings.rutracker_login,
             "login_password": settings.rutracker_password,
-            "login": submit_val,
+            "login": sv,
         })
-
-        # 5) POST на action (обычно с login_try=Y), без автоматического редиректа
-        post = self.scraper.post(
-            action,
-            data=data,
-            headers={"Referer": login_url},
-            allow_redirects=False
-        )
+        post = self.scraper.post(url, data=data, headers={"Referer":url})
         post.raise_for_status()
 
-        # 6) Если редирект — do a GET по Location, чтобы подхватить все куки
-        if post.status_code in (301, 302, 303):
-            loc = post.headers.get("Location")
-            if loc:
-                next_url = loc if loc.startswith("http") else urljoin(self.base_url + "/forum/", loc)
-                follow = self.scraper.get(next_url)
-                follow.raise_for_status()
-
-        # 7) Проверяем, что в cookies завёлся bb_session
         jar = self.scraper.cookies.get_dict()
-        if not jar.get("bb_session"):
+        if not (jar.get("bb_session") or jar.get("bb_sessionhash")):
             raise RuntimeError("LOGIN_NO_SESSION")
-
-        # 8) Сохраняем в Redis
+        # сразу сохраняем куки
         self.redis.set("rutracker:cookiejar", json.dumps(jar), ex=self.cookie_ttl)
-
 
     def _ensure_login(self):
         jar = self.scraper.cookies.get_dict()
@@ -242,34 +203,24 @@ class RutrackerService:
         if raw := self.redis.get(cache_key):
             return [TorrentInfo(**d) for d in json.loads(raw)]
 
+        self._ensure_login()
         search_url = f"{self.base_url}/forum/tracker.php"
 
-        # 1) Initial GET, detect redirect to login
-        r0 = self.scraper.get(search_url, params={"nm": query}, allow_redirects=False)
-        if r0.status_code in (301, 302) and "login.php" in (r0.headers.get("Location") or ""):
-            log.debug("→ [search] session expired, re-login")
-            self._ensure_login()
-            r0 = self.scraper.get(search_url, params={"nm": query})
-        r0.raise_for_status()
-
-        # extract optional form_token
+        # GET + POST первой страницы
+        r0 = self.scraper.get(search_url, params={"nm": query}); r0.raise_for_status()
         token = self._extract_form_token(r0.text)
-
-        # 2) POST first page
         post_data = {"nm": query, "f[]": "-1"}
         if token:
             post_data["form_token"] = token
-        r1 = self.scraper.post(search_url, data=post_data)
-        r1.raise_for_status()
-
+        r1 = self.scraper.post(search_url, data=post_data); r1.raise_for_status()
         doc1 = lxml.html.fromstring(r1.text)
 
-        # count pages
+        # сколько страниц
         total = int(_TOTAL_RE.search(doc1.text_content()).group(1) or 0)
         per_page = 50
         pages = ceil(total / per_page) if total else 1
 
-        # extract search_id for pagination
+        # вытащить search_id
         search_id = None
         for script in doc1.xpath("//script/text()"):
             if m := _PG_BASE_URL_RE.search(script):
@@ -285,17 +236,14 @@ class RutrackerService:
                 title = row.xpath(".//td[contains(@class,'t-title-col')]//a/text()")
                 if not title:
                     continue
-                forum_txt = forum[0].strip() if forum else ""
-                title_txt = title[0].strip()
+                forum_txt, title_txt = (forum[0].strip() if forum else "", title[0].strip())
                 combined = f"{forum_txt} {title_txt}".strip()
 
-                # lossless/lossy filter
+                # фильтр lossless/lossy
                 is_l = bool(_LOSSLESS_RE.search(combined))
                 is_y = bool(_LOSSY_RE.search(combined))
-                if only_lossless is True and (not is_l or is_y):
-                    continue
-                if only_lossless is False and is_l:
-                    continue
+                if only_lossless is True and (not is_l or is_y): continue
+                if only_lossless is False and is_l: continue
 
                 size_el = row.xpath(".//td[contains(@class,'tor-size')]//a/text()")
                 size = size_el[0].strip() if size_el else ""
@@ -310,31 +258,23 @@ class RutrackerService:
                 ti = TorrentInfo(title=combined, url=url, size=size, seeders=se, leechers=le)
                 parsed.append((ti, tid))
 
-        # parse first page
+        # первый проход
         _parse_page(doc1)
 
-        # parse remaining pages, re-authenticating if needed
+        # остальные страницы параллельно (с запасом по капче)
         if pages > 1 and search_id:
             offsets = [i * per_page for i in range(1, pages)]
             with ThreadPoolExecutor(max_workers=min(4, len(offsets))) as ex:
-                def fetch_and_parse(off: int):
-                    resp = self.scraper.get(search_url,
-                                            params={"search_id": search_id, "start": off},
-                                            allow_redirects=False)
-                    if resp.status_code in (301, 302) and "login.php" in (resp.headers.get("Location") or ""):
-                        log.debug(f"→ [page {off}] session expired, re-login")
-                        self._ensure_login()
-                        resp = self.scraper.get(search_url,
-                                                params={"search_id": search_id, "start": off})
+                for off in offsets:
+                    resp = self.scraper.get(search_url, params={"search_id": search_id, "start": off})
                     resp.raise_for_status()
                     _parse_page(lxml.html.fromstring(resp.text))
-                ex.map(fetch_and_parse, offsets)
 
-        # track filtering via cached blobs + filelists
+        # фильтрация по треку
         if track:
             results: List[TorrentInfo] = []
             t_low = track.lower()
-            for ti, tid in parsed[:50]:
+            for ti, tid in parsed[:50]:  # ограничим 50 первых, например
                 if t_low in ti.title.lower():
                     results.append(ti)
                     continue
@@ -348,19 +288,31 @@ class RutrackerService:
         else:
             final = [ti for ti, _ in parsed]
 
-        # cache and return
+        # кешируем финальный результат
         to_cache = [
-            {"title": r.title, "url": r.url, "size": r.size,
-             "seeders": r.seeders, "leechers": r.leechers}
+            {"title": r.title, "url": r.url, "size": r.size, "seeders": r.seeders, "leechers": r.leechers}
             for r in final
         ]
         self.redis.set(cache_key, json.dumps(to_cache), ex=self.search_ttl)
         return final
 
-
     async def search(self, query, only_lossless=None, track=None):
         import asyncio
-        return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
+        try:
+            return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
+        except Exception as e:
+            # если это наша специфичная ошибка «не нашёл tr-form»
+            if "'tr-form'" in str(e):
+                log.warning("tr-form not found: session probably expired or верстка изменилась — реботимся")
+                # сбросим куки в облаке и локально
+                self.scraper.cookies.clear()
+                self.redis.delete("rutracker:cookiejar")
+                # повторно залогинимся
+                self._ensure_login()
+                # один раз перезапускаем поиск
+                return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
+            # во всех остальных случаях — вверх
+            raise
 
     def _download_sync(self, topic_id: int) -> bytes:
         self._ensure_login()
