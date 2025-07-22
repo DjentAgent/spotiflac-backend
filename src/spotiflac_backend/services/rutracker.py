@@ -201,19 +201,30 @@ class RutrackerService:
     def _search_sync(self, query: str, only_lossless: Optional[bool], track: Optional[str]) -> List[TorrentInfo]:
         cache_key = f"search:{query}:{only_lossless}:{track}"
 
-        # 0) Всегда убеждаемся, что у нас валидная сессия
+        # 1) Убедиться, что сессия живая (при падении _ensure_login бросит CaptchaRequired)
         self._ensure_login()
 
-        # 1) Попробовать получить из кеша
+        # 2) Попытаться взять из кеша
         if raw := self.redis.get(cache_key):
             return [TorrentInfo(**d) for d in json.loads(raw)]
 
         search_url = f"{self.base_url}/forum/tracker.php"
 
-        # 2) GET + POST первой страницы
-        r0 = self.scraper.get(search_url, params={"nm": query})
+        # 3) GET первой страницы
+        r0 = self.scraper.get(search_url, params={"nm": query}, allow_redirects=False)
+        # если Cloudflare или авторизация редиректят на login.php — делаем ре‑логин и повторный GET
+        if r0.status_code in (301, 302) and "login.php" in (r0.headers.get("Location") or ""):
+            log.debug("→ [search] session expired on GET, re-login")
+            self.scraper.cookies.clear()
+            self.redis.delete("rutracker:cookiejar")
+            self._ensure_login()
+            r0 = self.scraper.get(search_url, params={"nm": query})
         r0.raise_for_status()
+
+        # 4) Извлечь form_token из JS (если есть)
         token = self._extract_form_token(r0.text)
+
+        # 5) POST первой страницы
         post_data = {"nm": query, "f[]": "-1"}
         if token:
             post_data["form_token"] = token
@@ -221,13 +232,13 @@ class RutrackerService:
         r1.raise_for_status()
         doc1 = lxml.html.fromstring(r1.text)
 
-        # 3) Подсчёт страниц
+        # 6) Сколько страниц
         text = doc1.text_content()
         total = int(_TOTAL_RE.search(text).group(1)) if _TOTAL_RE.search(text) else 0
         per_page = 50
         pages = ceil(total / per_page) if total else 1
 
-        # 4) Извлечь search_id
+        # 7) Найти search_id для пагинации
         search_id = None
         for script in doc1.xpath("//script/text()"):
             if m := _PG_BASE_URL_RE.search(script):
@@ -255,25 +266,33 @@ class RutrackerService:
 
                 url = urljoin(self.base_url + "/forum/",
                               row.xpath(".//a[contains(@href,'dl.php?t=')]/@href")[0])
-                ti = TorrentInfo(title=combined, url=url, size=size, seeders=se, leechers=le)
-                parsed.append((ti, tid))
+                parsed.append((TorrentInfo(title=combined, url=url, size=size, seeders=se, leechers=le), tid))
 
-        # 5) Парсим первую страницу
+        # 8) Спарсить первую страницу
         _parse_page(doc1)
 
-        # 6) Парсим остальные страницы, если есть
+        # 9) Спарсить остальные страницы
         if pages > 1 and search_id:
             offsets = [i * per_page for i in range(1, pages)]
             with ThreadPoolExecutor(max_workers=min(4, len(offsets))) as ex:
                 def fetch_and_parse(off: int):
                     resp = self.scraper.get(search_url,
-                                            params={"search_id": search_id, "start": off})
+                                            params={"search_id": search_id, "start": off},
+                                            allow_redirects=False)
+                    # аналогично, если вдруг редирект на login.php
+                    if resp.status_code in (301, 302) and "login.php" in (resp.headers.get("Location") or ""):
+                        log.debug(f"→ [page {off}] session expired, re-login")
+                        self.scraper.cookies.clear()
+                        self.redis.delete("rutracker:cookiejar")
+                        self._ensure_login()
+                        resp = self.scraper.get(search_url,
+                                                params={"search_id": search_id, "start": off})
                     resp.raise_for_status()
                     _parse_page(lxml.html.fromstring(resp.text))
 
-                ex.map(fetch_and_parse, offsets)
+                list(ex.map(fetch_and_parse, offsets))
 
-        # 7) Фильтрация по треку (при необходимости)
+        # 10) Фильтрация по track, если указано
         if track:
             results: List[TorrentInfo] = []
             t_low = track.lower()
@@ -285,16 +304,17 @@ class RutrackerService:
                     files = self._get_filelist(tid)
                 except CaptchaRequired:
                     continue
-                if any(t_low in f.lower() for f in files):
+                if any(t_low in f.lower() or fuzz.partial_ratio(t_low, f.lower()) >= 80 for f in files):
                     results.append(ti)
             final = results
         else:
             final = [ti for ti, _ in parsed]
 
-        # 8) Кешируем и возвращаем
-        to_cache = [{"title": r.title, "url": r.url, "size": r.size,
-                     "seeders": r.seeders, "leechers": r.leechers}
-                    for r in final]
+        # 11) Кешируем и возвращаем
+        to_cache = [
+            {"title": r.title, "url": r.url, "size": r.size, "seeders": r.seeders, "leechers": r.leechers}
+            for r in final
+        ]
         self.redis.set(cache_key, json.dumps(to_cache), ex=self.search_ttl)
         return final
 
@@ -306,16 +326,17 @@ class RutrackerService:
 
         try:
             return await _run()
+        except CaptchaRequired:
+            # проброс капчи наверх
+            raise
         except Exception as e:
             msg = str(e)
-            # при ошибках авторизации или разметки — сбрасываем сессию и повторяем
-            if "'tr-form'" in msg or "Login failed" in msg or "LOGIN_NO_SESSION" in msg:
-                log.warning("Session lost (%s), пересоздаём и повторяем поиск...", msg)
-                # очистить куки в cloudscraper
+            if "LOGIN_NO_SESSION" in msg or "session expired" in msg:
+                log.warning("Session died (%s), сбрасываем и повторяем...", msg)
+                # очистить куки
                 self.scraper.cookies.clear()
-                # удалить из Redis
                 self.redis.delete("rutracker:cookiejar")
-                # новая авторизация (может поднять CaptchaRequired)
+                # новая авторизация (может бросить CaptchaRequired)
                 self._ensure_login()
                 # повтор
                 return await _run()
