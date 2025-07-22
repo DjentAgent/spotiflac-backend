@@ -1,21 +1,18 @@
-import json
 import io
-import os
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 import aioredis
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from spotiflac_backend.core.config import settings
-from spotiflac_backend.services.rutracker import RutrackerService
+from spotiflac_backend.services.rutracker import RutrackerService, CaptchaRequired
 
-router = APIRouter(prefix="")
+router = APIRouter(prefix="")  # без префикса
 
 CAPTCHA_REQUIRED = 428
 
-# Pydantic‑модели
 class TorrentInfoResponse(BaseModel):
     title: str
     url: str
@@ -31,33 +28,33 @@ class CaptchaCompleteRequest(BaseModel):
     session_id: str
     solution: str
 
-# Настраиваем aioredis
 redis: aioredis.Redis = aioredis.from_url(
     settings.redis_url, encoding="utf-8", decode_responses=False
 )
 
-@router.post("/login/initiate", response_model=CaptchaInitResponse, responses={CAPTCHA_REQUIRED: {"model": CaptchaInitResponse}})
-async def login_initiate():
-    """
-    Инициализирует вход: если нужна капча, возвращает session_id и путь до картинки.
-    """
+@router.post(
+    "/login/initiate",
+    response_model=CaptchaInitResponse,
+    responses={CAPTCHA_REQUIRED: {"model": CaptchaInitResponse}},
+)
+async def login_initiate(request: Request):
     svc = RutrackerService()
     try:
-        try:
-            session_id, img_path = svc.initiate_login()
-            # Если капчи нет, сразу возвращаем пустой ответ (не должно случаться в текущем flow)
-            return {"session_id": session_id, "captcha_image": img_path}
-        except RuntimeError as e:
-            msg = str(e)
-            if msg.startswith("CAPTCHA_REQUIRED:"):
-                session_id = msg.split(":", 1)[1]
-                # возвращаем 428 с телом, чтобы клиент поймал
-                raise HTTPException(
-                    status_code=CAPTCHA_REQUIRED,
-                    detail={"session_id": session_id, "captcha_image": os.path.join(settings.captcha_base_url, f"captcha-{session_id}.png")}
-                )
-            # иначе пробрасываем
-            raise
+        sid, img_url = svc.initiate_login()
+        if sid is None:
+            # капча не нужна
+            return {"session_id": "", "captcha_image": ""}
+        # капча нужна — выброса исключения не произойдёт, метод бросает CaptchaRequired
+        # но на всякий случай:
+        raise HTTPException(
+            status_code=CAPTCHA_REQUIRED,
+            detail={"session_id": sid, "captcha_image": img_url}
+        )
+    except CaptchaRequired as c:
+        return HTTPException(
+            status_code=CAPTCHA_REQUIRED,
+            detail={"session_id": c.session_id, "captcha_image": c.img_url}
+        )
     finally:
         await svc.close()
 
@@ -78,6 +75,7 @@ async def login_complete(body: CaptchaCompleteRequest):
     responses={CAPTCHA_REQUIRED: {"description": "Captcha required"}},
 )
 async def search_torrents(
+    request: Request,
     q: str = Query(..., title="Search query"),
     lossless: Optional[bool] = Query(None, title="Only lossless"),
     track: Optional[str] = Query(None, title="Track name"),
@@ -85,12 +83,13 @@ async def search_torrents(
     svc = RutrackerService()
     try:
         return await svc.search(q, only_lossless=lossless, track=track)
+    except CaptchaRequired as c:
+        raise HTTPException(
+            status_code=CAPTCHA_REQUIRED,
+            detail={"session_id": c.session_id, "captcha_image": c.img_url}
+        )
     except RuntimeError as e:
-        msg = str(e)
-        if msg.startswith("CAPTCHA_REQUIRED:"):
-            session_id = msg.split(":", 1)[1]
-            raise HTTPException(status_code=CAPTCHA_REQUIRED, detail={"session_id": session_id})
-        raise HTTPException(status_code=502, detail=msg)
+        raise HTTPException(status_code=502, detail=str(e))
     finally:
         await svc.close()
 
@@ -99,22 +98,26 @@ async def search_torrents(
     response_class=StreamingResponse,
     responses={CAPTCHA_REQUIRED: {"description": "Captcha required"}},
 )
-async def download_torrent(topic_id: int):
+async def download_torrent(request: Request, topic_id: int):
     cache_key = f"torrent:{topic_id}"
     data = await redis.get(cache_key)
     if data is None:
         svc = RutrackerService()
         try:
             data = await svc.download(topic_id)
+        except CaptchaRequired as c:
+            raise HTTPException(
+                status_code=CAPTCHA_REQUIRED,
+                detail={"session_id": c.session_id, "captcha_image": c.img_url}
+            )
         except RuntimeError as e:
-            msg = str(e)
-            if msg.startswith("CAPTCHA_REQUIRED:"):
-                session_id = msg.split(":", 1)[1]
-                raise HTTPException(status_code=CAPTCHA_REQUIRED, detail={"session_id": session_id})
-            raise HTTPException(status_code=502, detail=f"Download failed: {msg}")
+            raise HTTPException(status_code=502, detail=str(e))
         finally:
             await svc.close()
         await redis.set(cache_key, data, ex=300)
 
-    headers = {"Content-Disposition": f'attachment; filename="{topic_id}.torrent"'}
-    return StreamingResponse(io.BytesIO(data), media_type="application/x-bittorrent", headers=headers)
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/x-bittorrent",
+        headers={"Content-Disposition": f'attachment; filename="{topic_id}.torrent"'},
+    )
