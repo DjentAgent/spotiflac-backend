@@ -63,19 +63,24 @@ class RutrackerService:
     def _login_sync(self):
         """
         Синхронный вход в Rutracker без капчи.
-        Делает GET для получения скрытых полей и form_token,
-        затем POST на login.php?login_try=Y, обрабатывает 302‑редирект
-        и сохраняет куки в Redis.
+        берёт action из формы (с login_try=Y), POST и обрабатывает 302,
+        затем сохраняет bb_session в Redis.
         """
-        # 1) GET формы логина
-        url = f"{self.base_url}/forum/login.php"
-        resp = self.scraper.get(url)
+        login_url = f"{self.base_url}/forum/login.php"
+        # 1) GET формы
+        resp = self.scraper.get(login_url)
         resp.raise_for_status()
+        html = resp.text
 
-        # 2) Извлекаем form_token (если есть) и скрытые поля
-        token = self._extract_form_token(resp.text)
-        doc = lxml.html.fromstring(resp.text)
+        # 2) Извлекаем form_token
+        token = self._extract_form_token(html)
+        doc = lxml.html.fromstring(html)
+
+        # 3) Находим саму форму и собираем скрытые поля
         form = doc.get_element_by_id("login-form-full")
+        action = form.action or "login.php"
+        if not action.startswith("http"):
+            action = urljoin(self.base_url + "/forum/", action)
         data = {
             inp.get("name"): inp.get("value", "")
             for inp in form.xpath(".//input[@type='hidden']")
@@ -84,7 +89,7 @@ class RutrackerService:
         if token:
             data["form_token"] = token
 
-        # 3) Подставляем учётные данные
+        # 4) Подставляем логин/пароль и значение кнопки
         submit_val = form.xpath(".//input[@type='submit']/@value")[0]
         data.update({
             "login_username": settings.rutracker_login,
@@ -92,31 +97,31 @@ class RutrackerService:
             "login": submit_val,
         })
 
-        # 4) POST на URL с login_try=Y, не следуем редиректам автоматически
-        post_url = url + "?login_try=Y"
+        # 5) POST на action (обычно с login_try=Y), без автоматического редиректа
         post = self.scraper.post(
-            post_url,
+            action,
             data=data,
-            headers={"Referer": url},
+            headers={"Referer": login_url},
             allow_redirects=False
         )
         post.raise_for_status()
 
-        # 5) Если получен 302‑редирект, делаем ещё один GET, чтобы отхватить все куки
+        # 6) Если редирект — do a GET по Location, чтобы подхватить все куки
         if post.status_code in (301, 302, 303):
             loc = post.headers.get("Location")
             if loc:
-                next_url = urljoin(self.base_url + "/forum/", loc)
-                resp2 = self.scraper.get(next_url)
-                resp2.raise_for_status()
+                next_url = loc if loc.startswith("http") else urljoin(self.base_url + "/forum/", loc)
+                follow = self.scraper.get(next_url)
+                follow.raise_for_status()
 
-        # 6) Проверяем, что после логина у нас есть bb_session
+        # 7) Проверяем, что в cookies завёлся bb_session
         jar = self.scraper.cookies.get_dict()
         if not jar.get("bb_session"):
             raise RuntimeError("LOGIN_NO_SESSION")
 
-        # 7) Сохраняем куки в Redis на cookie_ttl секунд
+        # 8) Сохраняем в Redis
         self.redis.set("rutracker:cookiejar", json.dumps(jar), ex=self.cookie_ttl)
+
 
     def _ensure_login(self):
         jar = self.scraper.cookies.get_dict()
