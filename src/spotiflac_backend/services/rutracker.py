@@ -178,32 +178,9 @@ class RutrackerService:
 
     def _download_sync(self, topic_id: int) -> bytes:
         self._ensure_login()
-
-        dl_url = f"{self.base_url}/forum/dl.php?t={topic_id}"
-        resp = self.scraper.get(dl_url, allow_redirects=False)
-
-        # Если редирект на login → повторная авторизация
-        if resp.is_redirect and "/login.php" in resp.headers.get("Location", ""):
-            log.warning("Download redirect to login, refreshing session and retrying...")
-            self._login_sync()
-            resp = self.scraper.get(dl_url, allow_redirects=True)
-
-        else:
-            # В случае 200 или другого редиректа — пробуем продолжить
-            if resp.is_redirect:
-                loc = resp.headers["Location"]
-                if not loc.startswith("http"):
-                    loc = f"{self.base_url}/forum/{loc.lstrip('/')}"
-                resp = self.scraper.get(loc)
-
-        resp.raise_for_status()
-
-        # Проверка: точно ли это .torrent
-        if b"announce" not in resp.content:
-            log.error("Downloaded content is not a valid .torrent file!")
-            raise ValueError("Invalid torrent file")
-
-        return resp.content
+        r = self.scraper.get(f"{self.base_url}/forum/dl.php?t={topic_id}", allow_redirects=True)
+        r.raise_for_status()
+        return r.content
 
     async def download(self, topic_id: int) -> bytes:
         import asyncio
