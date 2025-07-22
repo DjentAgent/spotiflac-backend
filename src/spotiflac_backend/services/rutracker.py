@@ -1,5 +1,3 @@
-# src/spotiflac_backend/services/rutracker.py
-
 import json
 import logging
 import re
@@ -24,6 +22,7 @@ _LOSSY_RE = re.compile(r"\b(mp3|aac|ogg|opus|lossy)\b", re.IGNORECASE)
 _TOTAL_RE = re.compile(r"Результатов поиска:\s*(\d+)", re.IGNORECASE)
 _PG_BASE_URL_RE = re.compile(r"PG_BASE_URL\s*:\s*['\"][^?]+\?([^'\"]+)['\"]", re.IGNORECASE)
 
+
 def _parse_filelist(torrent_bytes: bytes) -> List[str]:
     meta = bencodepy.decode(torrent_bytes)
     info = meta[b"info"]
@@ -31,9 +30,11 @@ def _parse_filelist(torrent_bytes: bytes) -> List[str]:
         return [info[b"filename"].decode(errors="ignore")]
     return ["/".join(p.decode(errors="ignore") for p in f[b"path"]) for f in info.get(b"files", [])]
 
+
 def _contains_track(filelist: List[str], track: str) -> bool:
     t = track.lower()
     return any(t in f.lower() or fuzz.partial_ratio(t, f.lower()) >= 80 for f in filelist)
+
 
 class RutrackerService:
     def __init__(self, base_url: str = None):
@@ -53,29 +54,34 @@ class RutrackerService:
             log.exception("Failed to load cookies from Redis")
 
     def _ensure_login(self):
+        """Check if session is still valid; if not, force re-login."""
         r = self.scraper.get(f"{self.base_url}/forum/tracker.php", allow_redirects=False)
-        if r.is_redirect:
-            log.info("Session cookie invalid, re-authenticating...")
+        if r.is_redirect and "login.php" in r.headers.get("Location", ""):
+            log.info("Session invalid or expired, re-authenticating...")
+            self.redis.delete("rutracker:cookiejar")
             self._login_sync()
         else:
             log.debug("Rutracker session valid")
 
     def _login_sync(self):
         login_url = f"{self.base_url}/forum/login.php"
-        r = self.scraper.get(login_url)
-        r.raise_for_status()
+        r = self.scraper.get(login_url); r.raise_for_status()
         doc = lxml.html.fromstring(r.text)
 
         try:
             form = doc.get_element_by_id("login-form-full")
         except KeyError:
-            raise RuntimeError("Login form not found (maybe blocked?)")
+            raise RuntimeError("Login form not found (possibly blocked or malformed HTML)")
 
         action = form.action or "login.php"
         if not action.startswith("http"):
             action = f"{self.base_url}/forum/{action.lstrip('/')}?login_try=Y"
 
-        data = {i.name: i.value for i in form.xpath(".//input[@type='hidden']") if i.name}
+        data = {
+            i.name: i.value
+            for i in form.xpath(".//input[@type='hidden']")
+            if i.name
+        }
         data.update({
             "login_username": settings.rutracker_login,
             "login_password": settings.rutracker_password,
@@ -87,11 +93,11 @@ class RutrackerService:
 
         cookies = self.scraper.cookies.get_dict()
         if not (cookies.get("bb_session") or cookies.get("bb_sessionhash")):
-            raise RuntimeError("Login failed: no session cookie")
+            raise RuntimeError("Login failed: session cookies not found")
 
         try:
             self.redis.set("rutracker:cookiejar", json.dumps(cookies), ex=self.cookie_ttl)
-            log.debug("Saved Rutracker cookies to Redis")
+            log.debug("Saved new cookies to Redis")
         except Exception:
             log.exception("Failed to save cookies to Redis")
 
@@ -101,27 +107,33 @@ class RutrackerService:
             return [TorrentInfo(**r) for r in json.loads(raw)]
 
         self._ensure_login()
+
         r0 = self.scraper.get(f"{self.base_url}/forum/tracker.php", params={"nm": query})
         r0.raise_for_status()
-
         doc0 = lxml.html.fromstring(r0.text)
+
         try:
             form = doc0.get_element_by_id("tr-form")
         except KeyError:
-            raise RuntimeError("'tr-form' not found — possibly blocked or not logged in")
+            raise RuntimeError("'tr-form' not found — possibly not logged in")
 
         action = form.action or f"{self.base_url}/forum/tracker.php"
         if not action.startswith("http"):
             action = f"{self.base_url}/forum/{action.lstrip('/')}"
 
-        post_data = {i.name: i.value for i in form.xpath(".//input[@type='hidden']") if i.name}
+        post_data = {
+            i.name: i.value
+            for i in form.xpath(".//input[@type='hidden']")
+            if i.name
+        }
         post_data.update({"nm": query, "f[]": "-1"})
 
         r1 = self.scraper.post(action, data=post_data); r1.raise_for_status()
         doc1 = lxml.html.fromstring(r1.text)
 
         total = int(_TOTAL_RE.search(doc1.text_content()).group(1)) if _TOTAL_RE.search(doc1.text_content()) else 0
-        per_page, pages = 50, ceil(total / 50) or 1
+        per_page = 50
+        pages = ceil(total / per_page) or 1
 
         search_id = None
         for script in doc1.xpath("//script/text()"):
@@ -146,7 +158,11 @@ class RutrackerService:
                     size = row.xpath(".//a[contains(@href,'dl.php?t=')]/text()")[0].replace("\xa0", " ").strip("↓ ").strip()
                     se = int(row.xpath(".//b[contains(@class,'seedmed')]/text()")[0] or 0)
                     le = int(row.xpath(".//td[contains(@class,'leechmed')]/text()")[0] or 0)
-                    parsed.append((TorrentInfo(title=title, url=urljoin(self.base_url + "/forum/", href), size=size, seeders=se, leechers=le), tid))
+                    parsed.append((
+                        TorrentInfo(title=title, url=urljoin(self.base_url + "/forum/", href),
+                                    size=size, seeders=se, leechers=le),
+                        tid
+                    ))
                 except Exception as e:
                     log.warning("Failed to parse row: %s", e)
 
@@ -154,7 +170,8 @@ class RutrackerService:
 
         if pages > 1 and search_id:
             offsets = [i * per_page for i in range(1, pages)]
-            def fetch(off): _parse_page(lxml.html.fromstring(self.scraper.get(f"{self.base_url}/forum/tracker.php", params={"search_id": search_id, "start": off}).text))
+            def fetch(off): _parse_page(lxml.html.fromstring(self.scraper.get(
+                f"{self.base_url}/forum/tracker.php", params={"search_id": search_id, "start": off}).text))
             with ThreadPoolExecutor(max_workers=min(4, len(offsets))) as ex:
                 ex.map(fetch, offsets)
 
@@ -162,8 +179,16 @@ class RutrackerService:
             def check_track(t: Tuple[TorrentInfo, int]) -> Optional[TorrentInfo]:
                 ti, tid = t
                 key = f"tracklist:{tid}"
-                fl = json.loads(self.redis.get(key)) if (raw := self.redis.get(key)) else _parse_filelist(self._download_sync(tid))
-                if not raw: self.redis.set(key, json.dumps(fl), ex=3600)
+                if (raw := self.redis.get(key)):
+                    fl = json.loads(raw)
+                else:
+                    try:
+                        data = self._download_sync(tid)
+                        fl = _parse_filelist(data)
+                        self.redis.set(key, json.dumps(fl), ex=3600)
+                    except Exception as e:
+                        log.warning("Failed to download/parse tracklist for %s: %s", tid, e)
+                        return None
                 return ti if _contains_track(fl, track) else None
             with ThreadPoolExecutor(max_workers=5) as ex:
                 return [r for r in ex.map(check_track, parsed) if r]
@@ -178,31 +203,17 @@ class RutrackerService:
 
     def _download_sync(self, topic_id: int) -> bytes:
         self._ensure_login()
-
         dl_url = f"{self.base_url}/forum/dl.php?t={topic_id}"
         resp = self.scraper.get(dl_url, allow_redirects=False)
 
-        # Если редирект на login → повторная авторизация
-        if resp.is_redirect and "/login.php" in resp.headers.get("Location", ""):
-            log.warning("Download redirect to login, refreshing session and retrying...")
+        if resp.is_redirect and "login.php" in resp.headers.get("Location", ""):
+            log.warning("Download redirect to login — reauthenticating...")
             self._login_sync()
             resp = self.scraper.get(dl_url, allow_redirects=True)
 
-        else:
-            # В случае 200 или другого редиректа — пробуем продолжить
-            if resp.is_redirect:
-                loc = resp.headers["Location"]
-                if not loc.startswith("http"):
-                    loc = f"{self.base_url}/forum/{loc.lstrip('/')}"
-                resp = self.scraper.get(loc)
-
         resp.raise_for_status()
-
-        # Проверка: точно ли это .torrent
         if b"announce" not in resp.content:
-            log.error("Downloaded content is not a valid .torrent file!")
-            raise ValueError("Invalid torrent file")
-
+            raise ValueError("Downloaded file is not a valid .torrent")
         return resp.content
 
     async def download(self, topic_id: int) -> bytes:
