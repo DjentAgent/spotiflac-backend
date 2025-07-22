@@ -298,20 +298,31 @@ class RutrackerService:
 
     async def search(self, query, only_lossless=None, track=None):
         import asyncio
-        try:
+
+        async def _attempt():
             return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
+
+        try:
+            # первая попытка
+            return await _attempt()
         except Exception as e:
-            # если это наша специфичная ошибка «не нашёл tr-form»
-            if "'tr-form'" in str(e):
-                log.warning("tr-form not found: session probably expired or верстка изменилась — реботимся")
-                # сбросим куки в облаке и локально
+            msg = str(e)
+            # если это ошибка «нет формы tr-form» или «не нашли сессионную куку»
+            if "'tr-form'" in msg or "Login failed, session cookie not found" in msg:
+                log.warning("Session lost or page structure changed (%s), повторный логин...", msg)
+                # 1) Очистить куки локально
                 self.scraper.cookies.clear()
+                # 2) Удалить сохранённые в Redis
                 self.redis.delete("rutracker:cookiejar")
-                # повторно залогинимся
-                self._ensure_login()
-                # один раз перезапускаем поиск
-                return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
-            # во всех остальных случаях — вверх
+                # 3) Заново залогиниться (с капчей, если потребуется)
+                try:
+                    self._ensure_login()
+                except CaptchaRequired as cap:
+                    # если потребуется капча — пробросить её клиенту
+                    raise
+                # 4) Повторить поиск
+                return await _attempt()
+            # если любая другая ошибка — пробрасываем
             raise
 
     def _download_sync(self, topic_id: int) -> bytes:
