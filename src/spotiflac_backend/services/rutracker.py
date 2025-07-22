@@ -228,16 +228,13 @@ class RutrackerService:
         if raw := self.redis.get(cache_key):
             return [TorrentInfo(**d) for d in json.loads(raw)]
 
-        # 1) Убедиться в логине/инициировать капчу
         self._ensure_login()
-
         search_url = f"{self.base_url}/forum/tracker.php"
-        # 2) GET чтобы получить form_token
+
+        # GET + POST для первой страницы
         r0 = self.scraper.get(search_url, params={"nm": query})
         r0.raise_for_status()
         token = self._extract_form_token(r0.text)
-
-        # 3) POST запрос
         post_data = {"nm": query, "f[]": "-1"}
         if token:
             post_data["form_token"] = token
@@ -245,12 +242,12 @@ class RutrackerService:
         r1.raise_for_status()
         doc1 = lxml.html.fromstring(r1.text)
 
-        # 4) Считаем страницы
-        total = int(_TOTAL_RE.search(doc1.text_content()).group(1)) if _TOTAL_RE.search(doc1.text_content()) else 0
+        # Подсчёт страниц
+        total = int(_TOTAL_RE.search(doc1.text_content()).group(1) or 0)
         per_page = 50
         pages = ceil(total / per_page) if total else 1
 
-        # 5) Ищем search_id
+        # Нужен search_id для пагинации
         search_id = None
         for script in doc1.xpath("//script/text()"):
             if m := _PG_BASE_URL_RE.search(script):
@@ -259,7 +256,6 @@ class RutrackerService:
 
         parsed: List[Tuple[TorrentInfo, int]] = []
 
-        # 6) Разбор одной страницы
         def _parse_page(doc):
             for row in doc.xpath("//table[@id='tor-tbl']//tr[@data-topic_id]"):
                 tid = int(row.get("data-topic_id"))
@@ -273,67 +269,75 @@ class RutrackerService:
                 title_txt = title[0].strip()
                 combined = f"{forum_txt} {title_txt}".strip()
 
-                # lossless/lossy
+                # lossless / lossy
                 is_l = bool(_LOSSLESS_RE.search(combined))
                 is_y = bool(_LOSSY_RE.search(combined))
-                if only_lossless is True and (not is_l or is_y):
-                    continue
-                if only_lossless is False and is_l:
-                    continue
+                if only_lossless is True and (not is_l or is_y): continue
+                if only_lossless is False and is_l: continue
 
                 # size
                 size_el = row.xpath(".//td[contains(@class,'tor-size')]//a/text()")
                 size = size_el[0].strip() if size_el else ""
 
-                # seeders
+                # seed / leech
                 st = row.xpath(".//b[contains(@class,'seedmed')]/text()")
-                st0 = st[0].strip() if st else "0"
-                se = int(st0) if st0.isdigit() else 0
-                # leechers
+                se = int(st[0].strip()) if st and st[0].strip().isdigit() else 0
                 lt = row.xpath(".//td[contains(@class,'leechmed')]/text()")
-                lt0 = lt[0].strip() if lt else "0"
-                le = int(lt0) if lt0.isdigit() else 0
+                le = int(lt[0].strip()) if lt and lt[0].strip().isdigit() else 0
 
-                parsed.append((
-                    TorrentInfo(
-                        # сохраняем forum+title в title
-                        title=combined,
-                        url=urljoin(self.base_url + "/forum/", row.xpath(".//a[contains(@href,'dl.php?t=')]/@href")[0]),
-                        size=size,
-                        seeders=se,
-                        leechers=le
-                    ),
-                    tid
-                ))
+                ti = TorrentInfo(
+                    title=combined,
+                    url=urljoin(self.base_url + "/forum/", row.xpath(".//a[contains(@href,'dl.php?t=')]/@href")[0]),
+                    size=size,
+                    seeders=se,
+                    leechers=le
+                )
+                parsed.append((ti, tid))
 
-        # 7) Первый проход
+        # первый проход
         _parse_page(doc1)
 
-        # 8) Остальные страницы
+        # остальные страницы
         if pages > 1 and search_id:
             offsets = [i * per_page for i in range(1, pages)]
-            def fetch(off):
-                resp = self.scraper.get(search_url, params={"search_id": search_id, "start": off})
-                resp.raise_for_status()
-                _parse_page(lxml.html.fromstring(resp.text))
-
             with ThreadPoolExecutor(max_workers=min(4, len(offsets))) as ex:
-                ex.map(fetch, offsets)
+                for _ in ex.map(lambda off: self.scraper.get(search_url, params={"search_id": search_id, "start": off}), offsets):
+                    pass  # просто прогоняем CAPTCHA-safe GET
+                # после завершения fetch-ей ещё раз парсим их:
+                for off in offsets:
+                    resp = self.scraper.get(search_url, params={"search_id": search_id, "start": off})
+                    resp.raise_for_status()
+                    _parse_page(lxml.html.fromstring(resp.text))
 
-        # 9) Фильтрация по треку (в title уже есть forum+title)
+        # фильтрация по треку: качаем .torrent пока не найдём совпадения
         if track:
-            t = track.lower()
-            results = [ti for ti, _ in parsed if t in ti.title.lower()]
+            results: List[TorrentInfo] = []
+            t_low = track.lower()
+            # ограничить число попыток, например до 50
+            for ti, tid in parsed[:50]:
+                # если уже есть в названии — сразу берём
+                if t_low in ti.title.lower():
+                    results.append(ti)
+                    continue
+                # иначе пробуем скачать .torrent
+                try:
+                    data = self._download_sync(tid)  # allow_redirects=True внутри
+                    files = self._parse_filelist(data)
+                except Exception:
+                    # может быть HTML-ответ или капча — пропускаем
+                    continue
+                # bencode дал список файлов
+                if any(t_low in f.lower() for f in files):
+                    results.append(ti)
+            final = results
         else:
-            results = [ti for ti, _ in parsed]
+            final = [ti for ti, _ in parsed]
 
-        # 10) Кэшируем и возвращаем
-        to_cache = [{
-            "title": r.title, "url": r.url,
-            "size": r.size, "seeders": r.seeders, "leechers": r.leechers
-        } for r in results]
+        # кешируем и возвращаем
+        to_cache = [{"title": r.title, "url": r.url, "size": r.size, "seeders": r.seeders, "leechers": r.leechers} for r in final]
         self.redis.set(cache_key, json.dumps(to_cache), ex=300)
-        return results
+        return final
+
 
 
 
