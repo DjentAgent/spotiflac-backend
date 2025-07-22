@@ -61,41 +61,59 @@ class RutrackerService:
         return m.group(1) if m else ""
 
     def _login_sync(self):
+        """
+        Делаем полноценный логин с получением bb_session.
+        Если после поста куки нет – бросаем CaptchaRequired.
+        """
         url = f"{self.base_url}/forum/login.php"
-        r = self.scraper.get(url); r.raise_for_status()
-        token = self._extract_form_token(r.text)
+        # 1) GET формы
+        r = self.scraper.get(url)
+        r.raise_for_status()
         doc = lxml.html.fromstring(r.text)
         form = doc.get_element_by_id("login-form-full")
-        data = {i.get("name"): i.get("value","") for i in form.xpath(".//input[@type='hidden']") if i.get("name")}
-        if token:
-            data["form_token"] = token
-        sv = form.xpath(".//input[@type='submit']/@value")[0]
+
+        # 2) Собираем скрытые поля + form_token
+        data = {
+            inp.get("name"): inp.get("value", "")
+            for inp in form.xpath(".//input[@type='hidden']")
+            if inp.get("name")
+        }
+        if token := _FORM_TOKEN_RE.search(r.text):
+            data["form_token"] = token.group(1)
+
+        # 3) Добавляем логин/пароль
         data.update({
             "login_username": settings.rutracker_login,
             "login_password": settings.rutracker_password,
-            "login": sv,
+            "login": form.xpath(".//input[@type='submit']/@value")[0],
         })
-        post = self.scraper.post(url, data=data, headers={"Referer":url})
-        post.raise_for_status()
 
+        # 4) POST + явный follow‑redirect для установки всех куки
+        resp = self.scraper.post(url, data=data, headers={"Referer": url}, allow_redirects=True)
+        resp.raise_for_status()
+
+        # 5) Проверяем куки
         jar = self.scraper.cookies.get_dict()
-        if not (jar.get("bb_session") or jar.get("bb_sessionhash")):
-            raise RuntimeError("LOGIN_NO_SESSION")
-        # сразу сохраняем куки
+        if not jar.get("bb_session"):
+            # если капча нужна — бросаем специально
+            raise CaptchaRequired(session_id=uuid.uuid4().hex, img_url=url)
+        # 6) Сохраняем в Redis
         self.redis.set("rutracker:cookiejar", json.dumps(jar), ex=self.cookie_ttl)
+        log.debug("→ [login] Success, bb_session=%s", jar.get("bb_session"))
 
     def _ensure_login(self):
-        jar = self.scraper.cookies.get_dict()
-        if jar.get("bb_session"):
-            return
+        """
+        Всегда делает _login_sync, даже если кука есть.
+        Это гарантирует, что после любой долгой паузы мы не отвалимся.
+        """
         try:
             self._login_sync()
-        except RuntimeError as e:
-            if str(e)=="LOGIN_NO_SESSION":
-                # падаем в капчу
-                self.initiate_login()
-            else:
-                raise
+        except CaptchaRequired:
+            # прокинем капчу наверх
+            raise
+        except Exception as e:
+            log.error("Login failed unexpectedly: %s", e)
+            raise
 
     def initiate_login(self) -> Tuple[Optional[str], Optional[str]]:
         login_url = f"{self.base_url}/forum/login.php"
@@ -210,9 +228,9 @@ class RutrackerService:
 
         search_url = f"{self.base_url}/forum/tracker.php"
 
-        # 3) GET первой страницы
+        # 3) GET первой страницы (без автоматических редиректов)
         r0 = self.scraper.get(search_url, params={"nm": query}, allow_redirects=False)
-        # если Cloudflare или авторизация редиректят на login.php — делаем ре‑логин и повторный GET
+        # если редиректят на login.php — обновляем сессию и повторяем GET
         if r0.status_code in (301, 302) and "login.php" in (r0.headers.get("Location") or ""):
             log.debug("→ [search] session expired on GET, re-login")
             self.scraper.cookies.clear()
@@ -279,7 +297,7 @@ class RutrackerService:
                     resp = self.scraper.get(search_url,
                                             params={"search_id": search_id, "start": off},
                                             allow_redirects=False)
-                    # аналогично, если вдруг редирект на login.php
+                    # если редиректят на login.php — ре‑логинимся и повторяем
                     if resp.status_code in (301, 302) and "login.php" in (resp.headers.get("Location") or ""):
                         log.debug(f"→ [page {off}] session expired, re-login")
                         self.scraper.cookies.clear()
@@ -320,26 +338,10 @@ class RutrackerService:
 
     async def search(self, query, only_lossless=None, track=None):
         import asyncio
-
-        async def _run():
-            return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
-
         try:
-            return await _run()
-        except CaptchaRequired:
-            # проброс капчи наверх
-            raise
-        except Exception as e:
-            msg = str(e)
-            if "LOGIN_NO_SESSION" in msg or "session expired" in msg:
-                log.warning("Session died (%s), сбрасываем и повторяем...", msg)
-                # очистить куки
-                self.scraper.cookies.clear()
-                self.redis.delete("rutracker:cookiejar")
-                # новая авторизация (может бросить CaptchaRequired)
-                self._ensure_login()
-                # повтор
-                return await _run()
+            return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
+        except CaptchaRequired as c:
+            # эскалируем капчу в контроллер
             raise
 
     def _download_sync(self, topic_id: int) -> bytes:
