@@ -26,8 +26,11 @@ services:
       - .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      DEBUG_HTML_DIR: /app/debug_html          # <- передаём в контейнер путь для дампов
     ports:
       - "8000:8000"
+    volumes:
+      - ./debug_html:/app/debug_html           # <- монтируем локальную папку в API
     depends_on:
       redis:
         condition: service_healthy
