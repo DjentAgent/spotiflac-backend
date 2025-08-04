@@ -39,10 +39,10 @@ def _human_size(nbytes: int) -> str:
 
 class PirateBayService:
     def __init__(
-        self,
-        api_base_url: Optional[str] = None,
-        redis_url:    Optional[str] = None,
-        max_filelist_concurrency: int = 10,
+            self,
+            api_base_url: Optional[str] = None,
+            redis_url: Optional[str] = None,
+            max_filelist_concurrency: int = 10,
     ) -> None:
         # Подхватываем из settings, если не передано явно
         base = api_base_url or getattr(settings, "piratebay_api_base", "https://apibay.org")
@@ -59,18 +59,18 @@ class PirateBayService:
         self.redis = aioredis.from_url(r_url, encoding="utf-8", decode_responses=True)
 
         # TTL кешей
-        self.search_ttl    = int(getattr(settings, "piratebay_search_ttl",   5 * 60))
-        self.filelist_ttl  = int(getattr(settings, "piratebay_filelist_ttl", 24 * 3600))
-        self.torrent_ttl   = int(getattr(settings, "piratebay_torrent_ttl",  7 * 24 * 3600))
+        self.search_ttl = int(getattr(settings, "piratebay_search_ttl", 5 * 60))
+        self.filelist_ttl = int(getattr(settings, "piratebay_filelist_ttl", 24 * 3600))
+        self.torrent_ttl = int(getattr(settings, "piratebay_torrent_ttl", 7 * 24 * 3600))
 
         # Семафор для ограничения одновременных filelist-запросов
         self._fl_sem = asyncio.Semaphore(max_filelist_concurrency)
 
     async def search(
-        self,
-        query: str,
-        only_lossless: Optional[bool] = None,
-        track: Optional[str] = None,
+            self,
+            query: str,
+            only_lossless: Optional[bool] = None,
+            track: Optional[str] = None,
     ) -> List[TorrentInfo]:
         """Асинхронный поиск с опциональным фильтром lossless и по названию трека."""
         cache_key = f"pb:search:{query}:{only_lossless}:{track}"
@@ -167,62 +167,57 @@ class PirateBayService:
         return names
 
     async def download(self, info: TorrentInfo) -> bytes:
-        """Асинхронная обёртка для _download_sync."""
-        return await asyncio.to_thread(self._download_sync, info)
-
-    def _download_sync(self, info: TorrentInfo) -> bytes:
-        """Синхронный блок для скачивания .torrent через внешние зеркала."""
-        # Извлекаем info_hash
+        # 1) extract the info-hash
         parsed = urlparse(info.url)
         qs = parse_qs(parsed.query)
         info_hash = None
 
+        # if you stuffed ?t=<id> into the URL, first fetch metadata to get the hash
         if "t" in qs and not info.url.startswith("magnet:"):
             tid = qs["t"][0]
-            try:
-                r = requests.get(f"{self.api_base}/t.php", params={"id": tid}, timeout=20)
-                r.raise_for_status()
-                meta = r.json()
-                info_hash = meta.get("info_hash")
-            except Exception as e:
-                log.exception("Metadata fetch error: %s", e)
+            async with self.http.get(f"{self.api_base}/t.php", params={"id": tid}) as meta_resp:
+                meta_resp.raise_for_status()
+                meta = await meta_resp.json()
+            info_hash = meta.get("info_hash")
         else:
+            # maybe it's already a magnet? look for xt=urn:btih:<hash>
             for xt in qs.get("xt", []):
                 if xt.startswith("urn:btih:"):
-                    info_hash = xt.split(":")[-1].upper()
+                    info_hash = xt.split(":", 2)[-1].upper()
                     break
 
         if not info_hash:
             raise HTTPException(status_code=400, detail="No info hash found")
 
         cache_key = f"pb:blob:{info_hash}"
-        if blob := asyncio.get_event_loop().run_until_complete(self.redis.get(cache_key)):
-            return blob if isinstance(blob, bytes) else blob.encode()
+        # 2) try cache
+        if cached := await self.redis.get(cache_key):
+            return cached if isinstance(cached, (bytes, bytearray)) else cached.encode()
 
+        # 3) try mirrors via aiohttp
         mirrors = [
             f"https://itorrents.org/torrent/{info_hash}.torrent",
             f"https://torrage.info/torrent/{info_hash}.torrent",
             f"https://btcache.me/torrent/{info_hash}",
         ]
-        last_err = None
-        for m in mirrors:
+        last_exc = None
+        for url in mirrors:
             try:
-                r = requests.get(m, timeout=30)
-                if r.status_code == 200 and (
-                    "application/x-bittorrent" in r.headers.get("Content-Type", "")
-                    or r.content.startswith(b"d8:announce")
-                ):
-                    data = r.content
-                    asyncio.get_event_loop().run_until_complete(
-                        self.redis.set(cache_key, data, ex=self.torrent_ttl)
-                    )
-                    return data
+                async with self.http.get(url) as torrent_resp:
+                    if torrent_resp.status == 200 and (
+                            "application/x-bittorrent" in torrent_resp.headers.get("Content-Type", "")
+                            or (await torrent_resp.content.read(12)).startswith(b"d8:announce")
+                    ):
+                        # rewind the stream if you peeked
+                        data = await torrent_resp.read()
+                        await self.redis.set(cache_key, data, ex=self.torrent_ttl)
+                        return data
             except Exception as e:
-                last_err = e
+                last_exc = e
                 continue
 
-        msg = "Torrent not found" if not last_err else f"Error fetching torrent: {last_err}"
-        raise HTTPException(status_code=404, detail=msg)
+        detail = "Torrent not found" if last_exc is None else f"Error fetching torrent: {last_exc}"
+        raise HTTPException(status_code=404, detail=detail)
 
     async def download_by_id(self, torrent_id: str) -> bytes:
         """Асинхронная загрузка по id через t.php и download."""

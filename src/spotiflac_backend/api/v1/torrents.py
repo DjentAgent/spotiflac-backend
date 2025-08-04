@@ -1,18 +1,7 @@
-"""
-FastAPI router providing endpoints for authentication, searching and
-downloading torrents from RuTracker and The Pirate Bay.  This module
-extends the existing RuTracker endpoints by adding search and download
-support for Pirate Bay while preserving backwards compatibility.
-
-The /search endpoint queries RuTracker, /search/piratebay queries
-Pirate Bay, and /download/{topic_id} serves `.torrent` files from both
-trackers depending on the ``tracker`` query parameter or the format of
-``topic_id``.
-"""
-
 import io
 import re
 import urllib.parse
+import asyncio
 from typing import List, Optional
 
 import aioredis
@@ -47,8 +36,7 @@ class CaptchaCompleteRequest(BaseModel):
     solution: str
 
 
-# Initialise asynchronous Redis client.  decode_responses=False ensures we
-# receive bytes for torrent blobs; keys remain strings.
+# Initialise asynchronous Redis client.
 redis: aioredis.Redis = aioredis.from_url(
     settings.redis_url, encoding="utf-8", decode_responses=False
 )
@@ -60,21 +48,18 @@ redis: aioredis.Redis = aioredis.from_url(
     responses={CAPTCHA_REQUIRED: {"model": CaptchaInitResponse}},
 )
 async def login_initiate(request: Request):
-    """Begin RuTracker login and return CAPTCHA info if required."""
     svc = RutrackerService()
     try:
         sid, img_url = svc.initiate_login()
         if sid is None:
-            # капча не нужна
             return {"session_id": "", "captcha_image": ""}
-        # капча нужна — выброса исключения не произойдёт, метод бросает CaptchaRequired
-        # но на всякий случай:
+        # shouldn't reach here, since initiate_login raises
         raise HTTPException(
             status_code=CAPTCHA_REQUIRED,
             detail={"session_id": sid, "captcha_image": img_url},
         )
     except CaptchaRequired as c:
-        return HTTPException(
+        raise HTTPException(
             status_code=CAPTCHA_REQUIRED,
             detail={"session_id": c.session_id, "captcha_image": c.img_url},
         )
@@ -84,7 +69,6 @@ async def login_initiate(request: Request):
 
 @router.post("/login/complete")
 async def login_complete(body: CaptchaCompleteRequest):
-    """Submit CAPTCHA solution and complete RuTracker login."""
     svc = RutrackerService()
     try:
         svc.complete_login(body.session_id, body.solution)
@@ -106,40 +90,64 @@ async def search_torrents(
     lossless: Optional[bool] = Query(None, title="Only lossless"),
     track: Optional[str] = Query(None, title="Track name"),
 ):
-    """Search RuTracker for torrents matching the query."""
-    svc = RutrackerService()
-    try:
-        # Perform the search
-        results = await svc.search(q, only_lossless=lossless, track=track)
-        # For each result, extract the topic ID from the ``url`` field and store
-        # the tracker source in Redis.  This allows the download endpoint to
-        # infer the correct tracker when ``tracker`` parameter is omitted.
-        try:
-            # Use a moderate TTL for the source mapping; 24 hours by default
-            source_ttl = 24 * 3600
-            for res in results:
-                if not res.url:
-                    continue
-                parsed = urllib.parse.urlparse(res.url)
-                qs = urllib.parse.parse_qs(parsed.query)
-                tid_list = qs.get("t")
-                if tid_list:
-                    tid = tid_list[0]
-                    # Store the source as bytes so that decode_responses=False is satisfied
-                    await redis.setex(f"torrent:source:{tid}", source_ttl, b"rutracker")
-        except Exception:
-            # Ignore mapping errors
-            pass
-        return results
-    except CaptchaRequired as c:
+    """Search both RuTracker and Pirate Bay in parallel and merge results."""
+    rt_svc = RutrackerService()
+    pb_svc = PirateBayService()
+
+    # Launch both searches in parallel
+    task_rt = asyncio.create_task(rt_svc.search(q, only_lossless=lossless, track=track))
+    task_pb = asyncio.create_task(pb_svc.search(q, only_lossless=lossless, track=track))
+
+    # Wait for both; capture exceptions
+    res_rt, res_pb = await asyncio.gather(task_rt, task_pb, return_exceptions=True)
+
+    # Always close
+    await rt_svc.close()
+    await pb_svc.close()
+
+    rt_results: List[TorrentInfoResponse] = []
+    pb_results: List[TorrentInfoResponse] = []
+
+    # Handle RuTracker result
+    if isinstance(res_rt, CaptchaRequired):
         raise HTTPException(
             status_code=CAPTCHA_REQUIRED,
-            detail={"session_id": c.session_id, "captcha_image": c.img_url},
+            detail={"session_id": res_rt.session_id, "captcha_image": res_rt.img_url},
         )
-    except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    finally:
-        await svc.close()
+    elif isinstance(res_rt, Exception):
+        # if PirateBay also failed, bail; otherwise ignore
+        if isinstance(res_rt, RuntimeError) or not isinstance(res_pb, list):
+            raise HTTPException(status_code=502, detail=str(res_rt))
+    else:
+        rt_results = res_rt
+
+    # Handle PirateBay result
+    if isinstance(res_pb, HTTPException):
+        # if Rt had no results too, propagate PB error
+        if not rt_results:
+            raise res_pb
+    elif isinstance(res_pb, Exception):
+        # ignore if Rt had results
+        if not rt_results:
+            raise HTTPException(status_code=502, detail=str(res_pb))
+    else:
+        pb_results = res_pb
+
+    # Cache source mapping for download inference
+    ttl = 24 * 3600
+    for r in rt_results:
+        parsed = urllib.parse.urlparse(r.url)
+        tid = urllib.parse.parse_qs(parsed.query).get("t")
+        if tid:
+            await redis.setex(f"torrent:source:{tid[0]}", ttl, b"rutracker")
+    for r in pb_results:
+        parsed = urllib.parse.urlparse(r.url)
+        tid = urllib.parse.parse_qs(parsed.query).get("t")
+        if tid:
+            await redis.setex(f"torrent:source:{tid[0]}", ttl, b"piratebay")
+
+    # Merge and return
+    return rt_results + pb_results
 
 
 @router.get(
@@ -153,34 +161,19 @@ async def search_piratebay(
     lossless: Optional[bool] = Query(None, title="Only lossless"),
     track: Optional[str] = Query(None, title="Track name"),
 ):
-    """Search The Pirate Bay for torrents matching the query.
-
-    This endpoint does not require a CAPTCHA and will forward API errors
-    as 502 responses.
-    """
     svc = PirateBayService()
     try:
         results = await svc.search(q, only_lossless=lossless, track=track)
-        # Map Pirate Bay IDs to their source in Redis for automatic tracker detection
-        try:
-            source_ttl = 24 * 3600
-            for res in results:
-                if not res.url:
-                    continue
-                parsed = urllib.parse.urlparse(res.url)
-                qs = urllib.parse.parse_qs(parsed.query)
-                tid_list = qs.get("t")
-                if tid_list:
-                    tid = tid_list[0]
-                    await redis.setex(f"torrent:source:{tid}", source_ttl, b"piratebay")
-        except Exception:
-            pass
+        ttl = 24 * 3600
+        for r in results:
+            parsed = urllib.parse.urlparse(r.url)
+            tid = urllib.parse.parse_qs(parsed.query).get("t")
+            if tid:
+                await redis.setex(f"torrent:source:{tid[0]}", ttl, b"piratebay")
         return results
-    except HTTPException as e:
-        # propagate HTTPException from the service
-        raise e
+    except HTTPException:
+        raise
     except Exception as e:
-        # wrap unexpected errors
         raise HTTPException(status_code=502, detail=str(e))
 
 
@@ -194,63 +187,43 @@ async def download_torrent(
     topic_id: str,
     tracker: Optional[str] = Query(
         None,
-        description="Source tracker: 'rutracker' or 'piratebay'. If omitted, the service will attempt to infer the source automatically.",
+        description="Source tracker: 'rutracker' or 'piratebay'. If omitted, inferred automatically.",
     ),
 ):
-    """Download a .torrent file from RuTracker or Pirate Bay.
-
-    When ``tracker`` is set to ``rutracker``, the numeric ``topic_id`` is used
-    with :class:`RutrackerService`.  When ``tracker`` is ``piratebay``, the
-    ``topic_id`` may be either a numeric Pirate Bay ID or a 40‑character
-    hexadecimal info hash.  If ``tracker`` is omitted, the handler will
-    attempt RuTracker for purely numeric IDs and Pirate Bay otherwise.
-    """
-    # Determine the cache key prefix based on the tracker and ID format
+    """Download a .torrent file from RuTracker or Pirate Bay."""
     def is_hex_hash(s: str) -> bool:
         return len(s) == 40 and re.fullmatch(r"[0-9a-fA-F]{40}", s) is not None
 
-    # infer tracker if not provided by consulting cached search source
+    # Infer tracker if needed
     if tracker is None:
-        inferred_tracker: str
         try:
-            source = await redis.get(f"torrent:source:{topic_id}")
+            src = await redis.get(f"torrent:source:{topic_id}")
         except Exception:
-            source = None
-        if source:
-            # decode_responses=False -> source is bytes
-            try:
-                inferred_tracker = source.decode().lower()
-            except Exception:
-                inferred_tracker = str(source).lower()
+            src = None
+        if src:
+            tracker = src.decode(errors="ignore").lower()
         else:
-            # Fallback: heuristically determine tracker by the format of the ID
-            if topic_id.isdigit():
-                inferred_tracker = "rutracker"
-            else:
-                inferred_tracker = "piratebay"
+            tracker = "rutracker" if topic_id.isdigit() else "piratebay"
     else:
-        inferred_tracker = tracker.lower()
+        tracker = tracker.lower()
 
-    # Build a unique cache key to avoid collisions between trackers
-    if inferred_tracker == "rutracker":
+    # Build cache key
+    if tracker == "rutracker":
         cache_key = f"torrent:rutracker:{topic_id}"
-    elif inferred_tracker == "piratebay":
+    elif tracker == "piratebay":
         if is_hex_hash(topic_id):
             cache_key = f"torrent:piratebay:hash:{topic_id.upper()}"
         else:
             cache_key = f"torrent:piratebay:id:{topic_id}"
     else:
-        # Unsupported tracker value
         raise HTTPException(status_code=400, detail="Unknown tracker specified")
 
-    # Try to get the torrent blob from cache
     data = await redis.get(cache_key)
     if data is None:
-        # Attempt to download from the appropriate service
-        if inferred_tracker == "rutracker":
-            # RuTracker expects an integer topic_id
+        # Download from selected service
+        if tracker == "rutracker":
             if not topic_id.isdigit():
-                raise HTTPException(status_code=400, detail="Invalid RuTracker topic ID")
+                raise HTTPException(status_code=400, detail="Invalid RuTracker ID")
             svc = RutrackerService()
             try:
                 data = await svc.download(int(topic_id))
@@ -259,32 +232,22 @@ async def download_torrent(
                     status_code=CAPTCHA_REQUIRED,
                     detail={"session_id": c.session_id, "captcha_image": c.img_url},
                 )
-            except RuntimeError as e:
-                raise HTTPException(status_code=502, detail=str(e))
             finally:
                 await svc.close()
         else:
-            # Pirate Bay
-            pb_svc = PirateBayService()
+            svc = PirateBayService()
             try:
                 if is_hex_hash(topic_id):
-                    data = await pb_svc.download_by_hash(topic_id)
+                    data = await svc.download_by_hash(topic_id)
                 else:
-                    # Try by ID; this will internally get info hash via t.php
-                    data = await pb_svc.download_by_id(topic_id)
-            except HTTPException as e:
-                # Propagate known errors (404, etc.)
-                raise e
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=str(e))
-        # Store in cache if download succeeded
-        if data:
-            await redis.set(cache_key, data, ex=300)
-        else:
-            # Should not happen: if data is still None
-            raise HTTPException(status_code=404, detail="Torrent not found")
+                    data = await svc.download_by_id(topic_id)
+            finally:
+                await svc.close()
 
-    # ``data`` is bytes; wrap in StreamingResponse
+        if not data:
+            raise HTTPException(status_code=404, detail="Torrent not found")
+        await redis.set(cache_key, data, ex=300)
+
     return StreamingResponse(
         io.BytesIO(data),
         media_type="application/x-bittorrent",
