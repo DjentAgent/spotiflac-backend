@@ -7,7 +7,7 @@ from urllib.parse import urlparse, parse_qs
 
 import aiohttp
 import aioredis
-import requests
+from aiohttp.client_exceptions import ContentTypeError
 from fastapi import HTTPException
 from rapidfuzz import fuzz
 
@@ -39,12 +39,11 @@ def _human_size(nbytes: int) -> str:
 
 class PirateBayService:
     def __init__(
-            self,
-            api_base_url: Optional[str] = None,
-            redis_url: Optional[str] = None,
-            max_filelist_concurrency: int = 10,
+        self,
+        api_base_url: Optional[str] = None,
+        redis_url:    Optional[str] = None,
+        max_filelist_concurrency: int = 10,
     ) -> None:
-        # Подхватываем из settings, если не передано явно
         base = api_base_url or getattr(settings, "piratebay_api_base", "https://apibay.org")
         self.api_base = base.rstrip("/")
 
@@ -59,20 +58,19 @@ class PirateBayService:
         self.redis = aioredis.from_url(r_url, encoding="utf-8", decode_responses=True)
 
         # TTL кешей
-        self.search_ttl = int(getattr(settings, "piratebay_search_ttl", 5 * 60))
+        self.search_ttl   = int(getattr(settings, "piratebay_search_ttl",   5 * 60))
         self.filelist_ttl = int(getattr(settings, "piratebay_filelist_ttl", 24 * 3600))
-        self.torrent_ttl = int(getattr(settings, "piratebay_torrent_ttl", 7 * 24 * 3600))
+        self.torrent_ttl  = int(getattr(settings, "piratebay_torrent_ttl",  7 * 24 * 3600))
 
         # Семафор для ограничения одновременных filelist-запросов
         self._fl_sem = asyncio.Semaphore(max_filelist_concurrency)
 
     async def search(
-            self,
-            query: str,
-            only_lossless: Optional[bool] = None,
-            track: Optional[str] = None,
+        self,
+        query: str,
+        only_lossless: Optional[bool] = None,
+        track: Optional[str] = None,
     ) -> List[TorrentInfo]:
-        """Асинхронный поиск с опциональным фильтром lossless и по названию трека."""
         cache_key = f"pb:search:{query}:{only_lossless}:{track}"
         if cached := await self.redis.get(cache_key):
             try:
@@ -81,9 +79,9 @@ class PirateBayService:
             except Exception:
                 log.exception("Failed to load search cache %s", cache_key)
 
-        # 1) запрос q.php
+        # 1) q.php
         url = f"{self.api_base}/q.php"
-        params = {"q": query, "cat": 0}
+        params = {"q": query, "cat": 100}
         try:
             async with self.http.get(url, params=params) as resp:
                 resp.raise_for_status()
@@ -92,7 +90,7 @@ class PirateBayService:
             log.exception("Search API error: %s", e)
             raise HTTPException(status_code=502, detail="PirateBay API error")
 
-        # 2) фильтр lossless/lossy
+        # 2) lossless/lossy filter
         filtered = []
         for it in items:
             name = it.get("name", "")
@@ -104,13 +102,13 @@ class PirateBayService:
                 continue
             filtered.append(it)
 
-        # 3) фильтр по треку (если нужно) — параллельно filelist
+        # 3) track filter (parallel filelist)
         if track:
             track_low = track.lower()
 
             async def check(it: dict) -> Optional[dict]:
                 async with self._fl_sem:
-                    fl = await self._get_filelist(it["id"])
+                    fl = await self._get_filelist(str(it["id"]))
                 for fname in fl:
                     f_low = fname.lower()
                     if track_low in f_low or fuzz.partial_ratio(track_low, f_low) >= 80:
@@ -121,26 +119,25 @@ class PirateBayService:
             results = await asyncio.gather(*coros)
             filtered = [it for it in results if it]
 
-        # 4) строим TorrentInfo и кешируем
+        # 4) build TorrentInfo + cache
         out: List[dict] = []
         infos: List[TorrentInfo] = []
         for it in filtered:
             size_bytes = int(it.get("size", 0))
             info = TorrentInfo(
-                title=it.get("name", ""),
-                url=f"https://thepiratebay.org/?t={it['id']}",
-                size=_human_size(size_bytes),
-                seeders=int(it.get("seeders", 0)),
-                leechers=int(it.get("leechers", 0)),
+                title   = it.get("name", ""),
+                url     = f"https://thepiratebay.org/?t={it['id']}",
+                size    = _human_size(size_bytes),
+                seeders = int(it.get("seeders", 0)),
+                leechers= int(it.get("leechers", 0)),
             )
             infos.append(info)
-            out.append(info.__dict__)  # <-- заменили .dict() на __dict__()
+            out.append(info.__dict__)
 
         await self.redis.set(cache_key, json.dumps(out), ex=self.search_ttl)
         return infos
 
     async def _get_filelist(self, torrent_id: str) -> List[str]:
-        """Асинхронно получает и кеширует список файлов через f.php."""
         cache_key = f"pb:fl:{torrent_id}"
         if cached := await self.redis.get(cache_key):
             try:
@@ -152,7 +149,14 @@ class PirateBayService:
         try:
             async with self.http.get(url, params={"id": torrent_id}) as resp:
                 resp.raise_for_status()
-                files = await resp.json()
+                try:
+                    files = await resp.json(content_type=None)
+                except ContentTypeError:
+                    text = await resp.text()
+                    files = json.loads(text)
+        except (ContentTypeError, json.JSONDecodeError) as e:
+            log.exception("Filelist parse error: %s", e)
+            raise HTTPException(status_code=502, detail="PirateBay filelist parse error")
         except Exception as e:
             log.exception("Filelist API error: %s", e)
             raise HTTPException(status_code=502, detail="PirateBay filelist error")
@@ -167,12 +171,11 @@ class PirateBayService:
         return names
 
     async def download(self, info: TorrentInfo) -> bytes:
-        # 1) extract the info-hash
+        # extract info_hash
         parsed = urlparse(info.url)
         qs = parse_qs(parsed.query)
         info_hash = None
 
-        # if you stuffed ?t=<id> into the URL, first fetch metadata to get the hash
         if "t" in qs and not info.url.startswith("magnet:"):
             tid = qs["t"][0]
             async with self.http.get(f"{self.api_base}/t.php", params={"id": tid}) as meta_resp:
@@ -180,7 +183,6 @@ class PirateBayService:
                 meta = await meta_resp.json()
             info_hash = meta.get("info_hash")
         else:
-            # maybe it's already a magnet? look for xt=urn:btih:<hash>
             for xt in qs.get("xt", []):
                 if xt.startswith("urn:btih:"):
                     info_hash = xt.split(":", 2)[-1].upper()
@@ -190,71 +192,53 @@ class PirateBayService:
             raise HTTPException(status_code=400, detail="No info hash found")
 
         cache_key = f"pb:blob:{info_hash}"
-        # 2) try cache
         if cached := await self.redis.get(cache_key):
             return cached if isinstance(cached, (bytes, bytearray)) else cached.encode()
 
-        # 3) try mirrors via aiohttp
+        # try multiple mirrors
         mirrors = [
             f"https://itorrents.org/torrent/{info_hash}.torrent",
-            f"https://torrage.info/torrent/{info_hash}.torrent",
-            f"https://btcache.me/torrent/{info_hash}",
+            f"https://btcache.me/torrent/{info_hash}.torrent",
+            f"https://torcache.net/torrent/{info_hash}.torrent",
         ]
         last_exc = None
         for url in mirrors:
             try:
                 async with self.http.get(url) as torrent_resp:
+                    data = await torrent_resp.read()
                     if torrent_resp.status == 200 and (
-                            "application/x-bittorrent" in torrent_resp.headers.get("Content-Type", "")
-                            or (await torrent_resp.content.read(12)).startswith(b"d8:announce")
+                        torrent_resp.headers.get("Content-Type", "").startswith("application/x-bittorrent")
+                        or data.startswith(b"d")
                     ):
-                        # rewind the stream if you peeked
-                        data = await torrent_resp.read()
                         await self.redis.set(cache_key, data, ex=self.torrent_ttl)
                         return data
             except Exception as e:
                 last_exc = e
-                continue
 
         detail = "Torrent not found" if last_exc is None else f"Error fetching torrent: {last_exc}"
         raise HTTPException(status_code=404, detail=detail)
 
     async def download_by_id(self, torrent_id: str) -> bytes:
-        """Асинхронная загрузка по id через t.php и download."""
         async with self.http.get(f"{self.api_base}/t.php", params={"id": torrent_id}) as resp:
             resp.raise_for_status()
             meta = await resp.json()
         info_hash = meta.get("info_hash")
         if not info_hash:
             raise HTTPException(status_code=404, detail="Metadata not found")
-        ti = TorrentInfo(
-            title="",
-            url=f"magnet:?xt=urn:btih:{info_hash}",
-            size="0 B",
-            seeders=0,
-            leechers=0,
-        )
+        ti = TorrentInfo(title="", url=f"magnet:?xt=urn:btih:{info_hash}",
+                         size="0 B", seeders=0, leechers=0)
         return await self.download(ti)
 
     async def download_by_hash(self, info_hash: str) -> bytes:
-        """Асинхронная загрузка по хэшу."""
-        ti = TorrentInfo(
-            title="",
-            url=f"magnet:?xt=urn:btih:{info_hash}",
-            size="0 B",
-            seeders=0,
-            leechers=0,
-        )
+        ti = TorrentInfo(title="", url=f"magnet:?xt=urn:btih:{info_hash}",
+                         size="0 B", seeders=0, leechers=0)
         return await self.download(ti)
 
     async def close(self) -> None:
-        """Закрыть HTTP-сессию и Redis-подключение."""
         await self.http.close()
         await self.redis.close()
 
     def __del__(self):
-        # Если закрытие не было выполнено явно
         if not self.http.closed:
             loop = asyncio.get_event_loop()
             loop.create_task(self.http.close())
-        # aioredis Connector закрывается вместе с сессией

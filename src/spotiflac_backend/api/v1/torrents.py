@@ -2,6 +2,7 @@ import io
 import re
 import urllib.parse
 import asyncio
+import logging
 from typing import List, Optional
 
 import aioredis
@@ -12,7 +13,7 @@ from pydantic import BaseModel
 from spotiflac_backend.core.config import settings
 from spotiflac_backend.services.rutracker import RutrackerService, CaptchaRequired
 from spotiflac_backend.services.pirate_bay_service import PirateBayService
-
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="")  # без префикса
 
 CAPTCHA_REQUIRED = 428
@@ -94,46 +95,69 @@ async def search_torrents(
     rt_svc = RutrackerService()
     pb_svc = PirateBayService()
 
-    # Launch both searches in parallel
-    task_rt = asyncio.create_task(rt_svc.search(q, only_lossless=lossless, track=track))
-    task_pb = asyncio.create_task(pb_svc.search(q, only_lossless=lossless, track=track))
+    # Запускаем PirateBay-поиск сразу
+    pb_task = asyncio.create_task(
+        pb_svc.search(q, only_lossless=lossless, track=track)
+    )
 
-    # Wait for both; capture exceptions
-    res_rt, res_pb = await asyncio.gather(task_rt, task_pb, return_exceptions=True)
+    # Параметры повторных попыток
+    max_rt_retries = getattr(settings, "rutracker_search_retries", 3)
+    rt_results: List[TorrentInfoResponse] = []
 
-    # Always close
+    # 1) RuTracker с retry
+    try:
+        for attempt in range(1, max_rt_retries + 2):  # +1 для первой попытки
+            rt_results = await rt_svc.search(q, only_lossless=lossless, track=track)
+            if rt_results:
+                break
+            log.debug(
+                "RuTracker search вернул пусто (попытка %d/%d), повторяю...",
+                attempt,
+                max_rt_retries + 1,
+            )
+    except CaptchaRequired as c:
+        # сразу отдаём капчу
+        await rt_svc.close()
+        await pb_svc.close()
+        raise HTTPException(
+            status_code=CAPTCHA_REQUIRED,
+            detail={"session_id": c.session_id, "captcha_image": c.img_url},
+        )
+    except RuntimeError as e:
+        # если не получилось и у PirateBay нет результатов — отваливаем
+        pb_res = []
+        try:
+            pb_res = await pb_task
+        except Exception:
+            pass
+        await rt_svc.close()
+        await pb_svc.close()
+        if not pb_res:
+            raise HTTPException(status_code=502, detail=str(e))
+        # иначе просто игнорируем ошибку RuTracker и продолжаем с PirateBay
+        rt_results = []
+
+    # 2) PirateBay
+    pb_results: List[TorrentInfoResponse] = []
+    try:
+        pb_results = await pb_task
+    except HTTPException as e:
+        if not rt_results:
+            # если RuTracker ничего не вернул — отдадим ошибку PirateBay
+            await rt_svc.close()
+            await pb_svc.close()
+            raise e
+    except Exception as e:
+        if not rt_results:
+            await rt_svc.close()
+            await pb_svc.close()
+            raise HTTPException(status_code=502, detail=str(e))
+
+    # Закрываем сессии
     await rt_svc.close()
     await pb_svc.close()
 
-    rt_results: List[TorrentInfoResponse] = []
-    pb_results: List[TorrentInfoResponse] = []
-
-    # Handle RuTracker result
-    if isinstance(res_rt, CaptchaRequired):
-        raise HTTPException(
-            status_code=CAPTCHA_REQUIRED,
-            detail={"session_id": res_rt.session_id, "captcha_image": res_rt.img_url},
-        )
-    elif isinstance(res_rt, Exception):
-        # if PirateBay also failed, bail; otherwise ignore
-        if isinstance(res_rt, RuntimeError) or not isinstance(res_pb, list):
-            raise HTTPException(status_code=502, detail=str(res_rt))
-    else:
-        rt_results = res_rt
-
-    # Handle PirateBay result
-    if isinstance(res_pb, HTTPException):
-        # if Rt had no results too, propagate PB error
-        if not rt_results:
-            raise res_pb
-    elif isinstance(res_pb, Exception):
-        # ignore if Rt had results
-        if not rt_results:
-            raise HTTPException(status_code=502, detail=str(res_pb))
-    else:
-        pb_results = res_pb
-
-    # Cache source mapping for download inference
+    # Кэшируем mapping для download
     ttl = 24 * 3600
     for r in rt_results:
         parsed = urllib.parse.urlparse(r.url)
@@ -146,8 +170,9 @@ async def search_torrents(
         if tid:
             await redis.setex(f"torrent:source:{tid[0]}", ttl, b"piratebay")
 
-    # Merge and return
+    # Объединяем и возвращаем сразу оба списка
     return rt_results + pb_results
+
 
 
 @router.get(
