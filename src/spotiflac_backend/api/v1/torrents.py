@@ -215,63 +215,108 @@ async def download_torrent(
         description="Source tracker: 'rutracker' or 'piratebay'. If omitted, inferred automatically.",
     ),
 ):
-    """Download a .torrent file from RuTracker or Pirate Bay."""
     def is_hex_hash(s: str) -> bool:
         return len(s) == 40 and re.fullmatch(r"[0-9a-fA-F]{40}", s) is not None
 
-    # Infer tracker if needed
+    async def try_piratebay(_id: str, strict: bool) -> Optional[bytes]:
+        svc = PirateBayService()
+        try:
+            if is_hex_hash(_id):
+                data = await svc.download_by_hash(_id)
+            else:
+                data = await svc.download_by_id(_id)
+            await redis.setex(f"torrent:source:{_id}", 24 * 3600, b"piratebay")
+            return data
+        except HTTPException as e:
+            if strict:
+                # источник однозначен — пробрасываем ошибку PB
+                raise
+            if e.status_code in (404, 422):
+                return None
+            raise
+        finally:
+            await svc.close()
+
+    async def try_rutracker(_id: str, strict: bool) -> Optional[bytes]:
+        if not _id.isdigit():
+            return None if not strict else HTTPException(status_code=400, detail="Invalid RuTracker ID")
+        svc = RutrackerService()
+        try:
+            data = await svc.download(int(_id))
+            await redis.setex(f"torrent:source:{_id}", 24 * 3600, b"rutracker")
+            return data
+        except CaptchaRequired as c:
+            raise HTTPException(
+                status_code=CAPTCHA_REQUIRED,
+                detail={"session_id": c.session_id, "captcha_image": c.img_url},
+            )
+        except Exception as e:
+            if strict:
+                # источник однозначен — пробрасываем 502
+                raise HTTPException(status_code=502, detail=str(e))
+            return None
+        finally:
+            await svc.close()
+
+    # 1) Узнаём источник
     if tracker is None:
         try:
             src = await redis.get(f"torrent:source:{topic_id}")
         except Exception:
             src = None
-        if src:
-            tracker = src.decode(errors="ignore").lower()
-        else:
-            tracker = "rutracker" if topic_id.isdigit() else "piratebay"
+        tracker = src.decode(errors="ignore").lower() if src else None
     else:
         tracker = tracker.lower()
 
-    # Build cache key
+    # 2) Кэш по источнику (если известен)
+    cache_key = None
     if tracker == "rutracker":
         cache_key = f"torrent:rutracker:{topic_id}"
     elif tracker == "piratebay":
-        if is_hex_hash(topic_id):
-            cache_key = f"torrent:piratebay:hash:{topic_id.upper()}"
-        else:
-            cache_key = f"torrent:piratebay:id:{topic_id}"
+        cache_key = f"torrent:piratebay:{'hash' if is_hex_hash(topic_id) else 'id'}:{topic_id if not is_hex_hash(topic_id) else topic_id.upper()}"
+
+    if cache_key:
+        cached = await redis.get(cache_key)
+        if cached:
+            return StreamingResponse(
+                io.BytesIO(cached),
+                media_type="application/x-bittorrent",
+                headers={"Content-Disposition": f'attachment; filename="{topic_id}.torrent"'},
+            )
+
+    # 3) Скачивание
+    data: Optional[bytes] = None
+    if tracker == "piratebay":
+        # источник определён — НИКАКОГО фолбэка на RT
+        data = await try_piratebay(topic_id, strict=True)
+    elif tracker == "rutracker":
+        # источник определён — НИКАКОГО фолбэка на PB
+        data = await try_rutracker(topic_id, strict=True)
     else:
-        raise HTTPException(status_code=400, detail="Unknown tracker specified")
+        # источник не известен: сначала PB, потом RT
+        data = await try_piratebay(topic_id, strict=False)
+        if data is None:
+            data = await try_rutracker(topic_id, strict=False)
 
-    data = await redis.get(cache_key)
-    if data is None:
-        # Download from selected service
-        if tracker == "rutracker":
-            if not topic_id.isdigit():
-                raise HTTPException(status_code=400, detail="Invalid RuTracker ID")
-            svc = RutrackerService()
-            try:
-                data = await svc.download(int(topic_id))
-            except CaptchaRequired as c:
-                raise HTTPException(
-                    status_code=CAPTCHA_REQUIRED,
-                    detail={"session_id": c.session_id, "captcha_image": c.img_url},
-                )
-            finally:
-                await svc.close()
-        else:
-            svc = PirateBayService()
-            try:
-                if is_hex_hash(topic_id):
-                    data = await svc.download_by_hash(topic_id)
-                else:
-                    data = await svc.download_by_id(topic_id)
-            finally:
-                await svc.close()
+    if not data:
+        raise HTTPException(status_code=404, detail="Torrent not found")
 
-        if not data:
-            raise HTTPException(status_code=404, detail="Torrent not found")
-        await redis.set(cache_key, data, ex=300)
+    # 4) Пишем кэш по реальному источнику
+    try:
+        src = await redis.get(f"torrent:source:{topic_id}")
+        src_decoded = src.decode(errors="ignore").lower() if src else None
+    except Exception:
+        src_decoded = None
+
+    if src_decoded == "rutracker":
+        cache_key = f"torrent:rutracker:{topic_id}"
+    elif src_decoded == "piratebay":
+        cache_key = f"torrent:piratebay:{'hash' if is_hex_hash(topic_id) else 'id'}:{topic_id if not is_hex_hash(topic_id) else topic_id.upper()}"
+    else:
+        # по умолчанию считаем PB
+        cache_key = f"torrent:piratebay:{'hash' if is_hex_hash(topic_id) else 'id'}:{topic_id if not is_hex_hash(topic_id) else topic_id.upper()}"
+
+    await redis.set(cache_key, data, ex=300)
 
     return StreamingResponse(
         io.BytesIO(data),
