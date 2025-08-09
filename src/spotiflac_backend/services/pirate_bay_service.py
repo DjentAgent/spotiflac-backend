@@ -77,7 +77,7 @@ class PirateBayService:
         api_base_url: Optional[str] = None,
         redis_url:    Optional[str] = None,
         max_filelist_concurrency: int = 10,
-        dht_timeout_sec: int = 60,  # таймаут DHT-фолбэка
+        dht_timeout_sec: int = 60,  # базовый таймаут DHT-фолбэка (может быть переопределён settings)
     ) -> None:
         base = api_base_url or getattr(settings, "piratebay_api_base", "https://apibay.org")
         self.api_base = base.rstrip("/")
@@ -108,11 +108,31 @@ class PirateBayService:
             "https://btcache.me/torrent/{HEX}.torrent",
             "https://torrage.info/torrent/{HEX}.torrent",
         ]
-        self._dht_timeout_sec = int(dht_timeout_sec)
+
+        # таймаут можно переопределить через настройки
+        self._dht_timeout_sec = int(getattr(settings, "piratebay_dht_timeout_sec", dht_timeout_sec or 120))
+
+        # дефолтные публичные трекеры (сливаются с теми, что придут из magnet)
+        cfg_trackers = getattr(settings, "piratebay_default_trackers", None)
+        self._default_trackers: list[str] = (
+            list(cfg_trackers) if isinstance(cfg_trackers, (list, tuple)) and cfg_trackers else [
+                "udp://tracker.opentrackr.org:1337/announce",
+                "udp://open.stealth.si:80/announce",
+                "udp://tracker.torrent.eu.org:451/announce",
+                "udp://tracker-udp.gbitt.info:80/announce",
+                "udp://opentracker.i2p.rocks:6969/announce",
+                "udp://explodie.org:6969/announce",
+                "udp://tracker.internetwarriors.net:1337/announce",
+                "udp://tracker1.bt.moack.co.kr:80/announce",
+                "http://tracker.opentrackr.org:1337/announce",
+                "http://open.tracker.cl:1337/announce",
+            ]
+        )
 
         log.info(
-            "PirateBayService init: api_base=%s, redis=%s, DHT=%s, mirrors=%s",
-            self.api_base, r_url, ("enabled" if lt else "disabled (libtorrent not installed)"), self._mirrors
+            "PirateBayService init: api_base=%s, redis=%s, DHT=%s, mirrors=%s, default_trackers=%d, dht_timeout=%ds",
+            self.api_base, r_url, ("enabled" if lt else "disabled (libtorrent not installed)"),
+            self._mirrors, len(self._default_trackers), self._dht_timeout_sec
         )
 
     # ----------------- cache helpers (torrent blob) -----------------
@@ -365,7 +385,19 @@ class PirateBayService:
             log.info("DHT fallback skipped: libtorrent not installed")
             return None
 
-        log.info("DHT/TR fallback: starting for %s (timeout=%ds, trackers=%d)", info_hash_hex, timeout_sec, len(trackers))
+        # объединяем трекеры: из magnet + дефолтные, с удалением дублей и пустых
+        trackers_all: list[str] = []
+        seen = set()
+        for tr in (trackers or []) + self._default_trackers:
+            if tr and tr not in seen:
+                trackers_all.append(tr)
+                seen.add(tr)
+
+        log.info(
+            "DHT/TR fallback: starting for %s (timeout=%ds, trackers=%d)",
+            info_hash_hex, timeout_sec, len(trackers_all)
+        )
+
         ses = lt.session()
         try:
             ses.listen_on(6881, 6891)
@@ -381,21 +413,25 @@ class PirateBayService:
             uri = f"magnet:?xt=urn:btih:{info_hash_hex}"
             params = lt.parse_magnet_uri(uri)
             params.save_path = "."
-            # добавим трекеры из магнита + пару открытых
             if hasattr(params, "trackers") and isinstance(params.trackers, list):
-                params.trackers.extend(trackers)
-                params.trackers.extend([
-                    "udp://tracker.opentrackr.org:1337/announce",
-                    "udp://open.stealth.si:80/announce",
-                ])
+                params.trackers.extend(trackers_all)
 
             h = ses.add_torrent(params)
+            # ускоряем: объявляемся в трекеры и DHT
+            try:
+                h.force_reannounce(0)
+            except Exception:
+                pass
+            try:
+                h.force_dht_announce()
+            except Exception:
+                pass
 
             start = time.time()
             next_log = start
             while time.time() - start < max(10, timeout_sec) and not h.has_metadata():
                 time.sleep(0.3)
-                # логируем алёрты libtorrent
+                # алёрты libtorrent
                 alerts = ses.pop_alerts()
                 for a in alerts:
                     what = getattr(a, "what", lambda: a.__class__.__name__)()
@@ -421,12 +457,7 @@ class PirateBayService:
             ti = h.get_torrent_info()
             ct = lt.create_torrent(ti)
             # переносим трекеры в финальный .torrent
-            for tr in trackers:
-                try:
-                    ct.add_tracker(tr)
-                except Exception:
-                    pass
-            for tr in ["udp://tracker.opentrackr.org:1337/announce", "udp://open.stealth.si:80/announce"]:
+            for tr in trackers_all:
                 try:
                     ct.add_tracker(tr)
                 except Exception:
