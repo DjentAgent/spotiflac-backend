@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import urllib.parse
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -250,6 +251,39 @@ class PirateBayService:
         log.debug("Filelist cache set for id=%s: %d files, ttl=%d", torrent_id, len(names), self.filelist_ttl)
         return names
 
+    # ------------------------------ magnet/tracker helpers ------------------------------
+    async def _magnet_from_page(self, torrent_id: str) -> tuple[Optional[str], list[str]]:
+        """Возвращает (btih_hex, trackers) из первой magnet-ссылки на странице TPB."""
+        for url in (
+            f"https://thepiratebay.org/?t={torrent_id}",
+            f"https://thepiratebay.org/description.php?id={torrent_id}",
+        ):
+            try:
+                async with self.http.get(url) as resp:
+                    if resp.status != 200:
+                        continue
+                    html = await resp.text()
+            except Exception:
+                continue
+
+            m = re.search(r'href=["\'](magnet:\?[^"\']+)', html, re.IGNORECASE)
+            if not m:
+                continue
+
+            magnet = m.group(1)
+            parsed = urllib.parse.urlparse(magnet)
+            qs = urllib.parse.parse_qs(parsed.query)
+
+            btih = None
+            for xt in qs.get("xt", []):
+                if xt.lower().startswith("urn:btih:"):
+                    btih = _hex_upper_from_btih(xt)
+                    break
+
+            trackers = [urllib.parse.unquote_plus(t) for t in qs.get("tr", [])]
+            return btih, trackers
+        return None, []
+
     # ------------------------------ info_hash resolve ------------------------------
     async def _resolve_info_hash_from_id(self, torrent_id: str) -> Optional[str]:
         cache_key = f"pb:id2hash:{torrent_id}"
@@ -275,16 +309,12 @@ class PirateBayService:
         except Exception as e:
             log.warning("id2hash: t.php error for id=%s: %s", torrent_id, e)
 
-        # 2) fallback с HTML-страниц
-        for page in (
-            f"https://thepiratebay.org/?t={torrent_id}",
-            f"https://thepiratebay.org/description.php?id={torrent_id}",
-        ):
-            ih_fb = await self._btih_from_page(page)
-            log.debug("id2hash: page=%s -> btih=%s", page, ih_fb)
-            if ih_fb:
-                await self.redis.set(cache_key, ih_fb, ex=self.id2hash_ttl)
-                return ih_fb
+        # 2) HTML: берём magnet и вытаскиваем btih
+        ih_fb, _ = await self._magnet_from_page(torrent_id)
+        log.debug("id2hash: magnet_from_page -> btih=%s", ih_fb)
+        if ih_fb:
+            await self.redis.set(cache_key, ih_fb, ex=self.id2hash_ttl)
+            return ih_fb
 
         log.debug("id2hash: failed to resolve id=%s", torrent_id)
         return None
@@ -329,13 +359,13 @@ class PirateBayService:
             return None
         return None
 
-    # ------------------------------ DHT fallback ------------------------------
-    def _dht_fetch_torrent_blocking(self, info_hash_hex: str, timeout_sec: int) -> Optional[bytes]:
+    # ------------------------------ DHT+Trackers fallback ------------------------------
+    def _dht_fetch_torrent_blocking(self, info_hash_hex: str, timeout_sec: int, trackers: list[str]) -> Optional[bytes]:
         if lt is None:
             log.info("DHT fallback skipped: libtorrent not installed")
             return None
 
-        log.info("DHT fallback: starting for %s (timeout=%ds)", info_hash_hex, timeout_sec)
+        log.info("DHT/TR fallback: starting for %s (timeout=%ds, trackers=%d)", info_hash_hex, timeout_sec, len(trackers))
         ses = lt.session()
         try:
             ses.listen_on(6881, 6891)
@@ -351,43 +381,64 @@ class PirateBayService:
             uri = f"magnet:?xt=urn:btih:{info_hash_hex}"
             params = lt.parse_magnet_uri(uri)
             params.save_path = "."
+            # добавим трекеры из магнита + пару открытых
+            if hasattr(params, "trackers") and isinstance(params.trackers, list):
+                params.trackers.extend(trackers)
+                params.trackers.extend([
+                    "udp://tracker.opentrackr.org:1337/announce",
+                    "udp://open.stealth.si:80/announce",
+                ])
+
             h = ses.add_torrent(params)
 
             start = time.time()
             next_log = start
             while time.time() - start < max(10, timeout_sec) and not h.has_metadata():
                 time.sleep(0.3)
+                # логируем алёрты libtorrent
+                alerts = ses.pop_alerts()
+                for a in alerts:
+                    what = getattr(a, "what", lambda: a.__class__.__name__)()
+                    msg  = getattr(a, "message", lambda: str(a))()
+                    if "error" in what.lower() or "failed" in what.lower():
+                        log.warning("lt-alert: %s — %s", what, msg)
+                    else:
+                        log.debug("lt-alert: %s — %s", what, msg)
+
                 now = time.time()
                 if now - next_log >= 5:
                     st = h.status()
                     log.debug(
-                        "DHT: waiting metadata... peers=%d, download_rate=%.1fKB/s, elapsed=%.1fs",
-                        st.num_peers, st.download_rate / 1024, now - start
+                        "DHT/TR: waiting metadata... peers=%d, down=%.1fKB/s, up=%.1fKB/s, elapsed=%.1fs",
+                        st.num_peers, st.download_rate / 1024, st.upload_rate / 1024, now - start
                     )
                     next_log = now
 
             if not h.has_metadata():
-                log.info("DHT fallback: timeout without metadata for %s", info_hash_hex)
+                log.info("DHT/TR fallback: timeout without metadata for %s", info_hash_hex)
                 return None
 
             ti = h.get_torrent_info()
             ct = lt.create_torrent(ti)
-            for tr in [
-                "udp://tracker.opentrackr.org:1337/announce",
-                "udp://open.stealth.si:80/announce",
-            ]:
+            # переносим трекеры в финальный .torrent
+            for tr in trackers:
                 try:
                     ct.add_tracker(tr)
-                except Exception as e:
-                    log.debug("DHT: add_tracker warning: %s", e)
+                except Exception:
+                    pass
+            for tr in ["udp://tracker.opentrackr.org:1337/announce", "udp://open.stealth.si:80/announce"]:
+                try:
+                    ct.add_tracker(tr)
+                except Exception:
+                    pass
 
             torrent_dict = ct.generate()
             data = lt.bencode(torrent_dict)
-            log.info("DHT fallback: success for %s (size=%d bytes, elapsed=%.2fs)",
+            log.info("DHT/TR fallback: success for %s (size=%d bytes, elapsed=%.2fs)",
                      info_hash_hex, len(data), time.time() - start)
             return bytes(data)
         except Exception as e:
-            log.exception("DHT fallback: unexpected error for %s: %s", info_hash_hex, e)
+            log.exception("DHT/TR fallback: unexpected error for %s: %s", info_hash_hex, e)
             return None
         finally:
             try:
@@ -395,17 +446,26 @@ class PirateBayService:
             except Exception:
                 pass
 
-    async def _dht_fetch_torrent(self, info_hash_hex: str, timeout_sec: int) -> Optional[bytes]:
-        return await asyncio.to_thread(self._dht_fetch_torrent_blocking, info_hash_hex, timeout_sec)
+    async def _dht_fetch_torrent(self, info_hash_hex: str, timeout_sec: int, trackers: list[str]) -> Optional[bytes]:
+        return await asyncio.to_thread(self._dht_fetch_torrent_blocking, info_hash_hex, timeout_sec, trackers)
 
     # ------------------------------ download ------------------------------
     async def download(self, info: TorrentInfo) -> bytes:
         log.debug("download(): title=%s url=%s", info.title, info.url)
 
-        # 1) magnet → btih
-        info_hash_hex = self._extract_btih_from_url(info.url)
+        trackers: list[str] = []
 
-        # 2) ?t=/id → btih
+        # 1) magnet → btih + trackers
+        if info.url.startswith("magnet:"):
+            parsed = urlparse(info.url)
+            qs = parse_qs(parsed.query)
+            for tr in qs.get("tr", []):
+                trackers.append(urllib.parse.unquote_plus(tr))
+            info_hash_hex = self._extract_btih_from_url(info.url)
+        else:
+            info_hash_hex = None
+
+        # 2) ?t=/id → btih (+ трекеры со страницы)
         if not info_hash_hex:
             parsed = urlparse(info.url)
             qs = parse_qs(parsed.query)
@@ -417,6 +477,9 @@ class PirateBayService:
             log.debug("download(): extracted tid=%s from url", tid)
             if tid:
                 info_hash_hex = await self._resolve_info_hash_from_id(tid)
+                if not trackers:
+                    _, trks = await self._magnet_from_page(tid)
+                    trackers.extend(trks)
 
         if not info_hash_hex:
             log.info("download(): cannot resolve BTIH for url=%s", info.url)
@@ -449,11 +512,11 @@ class PirateBayService:
                 last_exc = e
                 continue
 
-        # 4) фолбэк через DHT (если доступен libtorrent)
-        dht_data = await self._dht_fetch_torrent(info_hash_hex, self._dht_timeout_sec)
+        # 4) DHT+Trackers fallback
+        dht_data = await self._dht_fetch_torrent(info_hash_hex, self._dht_timeout_sec, trackers)
         if dht_data:
             await self._cache_set_blob(cache_key, dht_data, ex=self.torrent_ttl)
-            log.info("download(): returned DHT-synthesized .torrent for btih=%s", info_hash_hex)
+            log.info("download(): returned DHT/TR-synthesized .torrent for btih=%s", info_hash_hex)
             return dht_data
 
         detail = "Torrent not found in public caches"
