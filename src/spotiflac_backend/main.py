@@ -16,6 +16,7 @@ from fastapi_cache.backends.redis import RedisBackend
 from spotiflac_backend.core.config import settings
 from spotiflac_backend.api.v1.health import router as health_router
 from spotiflac_backend.api.v1.torrents import router as torrents_router
+from spotiflac_backend.api.v1.spotify import router as spotify_router
 
 app = FastAPI(title="SpotiFlac Backend")
 
@@ -48,4 +49,11 @@ app.include_router(
     torrents_router,
     prefix="/api/v1/torrents",
     tags=["torrents"],
+)
+
+# spotify (public)
+app.include_router(
+    spotify_router,
+    prefix="/api/v1/spotify",
+    tags=["spotify"],
 )
