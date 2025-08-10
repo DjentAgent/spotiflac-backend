@@ -192,14 +192,30 @@ class PirateBayService:
             async with self.http.get(url, params=params) as resp:
                 resp.raise_for_status()
                 items = await resp.json()
-                log.debug("Search response: %d items", len(items))
+                log.debug("Search response: %d raw items", len(items))
         except Exception as e:
             log.exception("Search API error: %s", e)
             raise HTTPException(status_code=502, detail="PirateBay API error")
 
-        before = len(items)
+        # --- ВАЖНО: убираем «пустышку» от apibay ---
+        clean_items = []
+        skipped_dummy = 0
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict):
+                continue
+            tid = str(it.get("id", "")).strip()
+            name = (it.get("name") or "").strip()
+            # Отбрасываем id == "0" и/или имя "No results returned"
+            if not tid.isdigit() or tid == "0" or name.lower().startswith("no results"):
+                skipped_dummy += 1
+                continue
+            clean_items.append(it)
+        if skipped_dummy:
+            log.debug("Search: dropped %d dummy 'No results returned' items", skipped_dummy)
+
+        before = len(clean_items)
         filtered = []
-        for it in items:
+        for it in clean_items:
             name = it.get("name", "") or ""
             is_l = bool(_LOSSLESS_RE.search(name))
             is_y = bool(_LOSSY_RE.search(name))
