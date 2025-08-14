@@ -21,11 +21,11 @@ from spotiflac_backend.models.torrent import TorrentInfo
 log = logging.getLogger(__name__)
 
 # Регулярные выражения для определения lossless/lossy
-_LOSSLESS_RE    = re.compile(r"\b(flac|wavpack|wv|ape|alac|aiff|pcm|dts|mlp|tta|mqa|lossless)\b", re.IGNORECASE)
-_LOSSY_RE       = re.compile(r"\b(mp3|aac|ogg|opus|lossy)\b", re.IGNORECASE)
+_LOSSLESS_RE = re.compile(r"\b(flac|wavpack|wv|ape|alac|aiff|pcm|dts|mlp|tta|mqa|lossless)\b", re.IGNORECASE)
+_LOSSY_RE = re.compile(r"\b(mp3|aac|ogg|opus|lossy)\b", re.IGNORECASE)
 _PG_BASE_URL_RE = re.compile(r"PG_BASE_URL\s*:\s*['\"][^?]+\?([^'\"]+)['\"]", re.IGNORECASE)
-_TOTAL_RE       = re.compile(r"Результатов поиска:\s*(\d+)", re.IGNORECASE)
-_FORM_TOKEN_RE  = re.compile(r"form_token\s*:\s*'([0-9a-f]+)'", re.IGNORECASE)
+_TOTAL_RE = re.compile(r"Результатов поиска:\s*(\d+)", re.IGNORECASE)
+_FORM_TOKEN_RE = re.compile(r"form_token\s*:\s*'([0-9a-f]+)'", re.IGNORECASE)
 
 
 class CaptchaRequired(Exception):
@@ -47,17 +47,17 @@ class RutrackerService:
     """
 
     def __init__(self, base_url: Optional[str] = None):
-        self.base_url     = (base_url or settings.rutracker_base).rstrip("/")
-        self.scraper      = cloudscraper.create_scraper(
-            browser={"browser":"chrome","platform":"windows","mobile":False},
+        self.base_url = (base_url or settings.rutracker_base).rstrip("/")
+        self.scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False},
             delay=10
         )
-        self.redis        = redis.Redis.from_url(settings.redis_url)
-        self.cookie_ttl   = getattr(settings, "rutracker_cookie_ttl",   24*3600)
-        self.filelist_ttl = getattr(settings, "rutracker_filelist_ttl", 24*3600)
-        self.blob_ttl     = getattr(settings, "rutracker_blob_ttl",     7*24*3600)
-        self.search_ttl   = getattr(settings, "rutracker_search_ttl",   5*60)
-        self.dump_dir     = getattr(settings, "debug_html_dir", "/app/debug_html")
+        self.redis = redis.Redis.from_url(settings.redis_url)
+        self.cookie_ttl = getattr(settings, "rutracker_cookie_ttl", 24 * 3600)
+        self.filelist_ttl = getattr(settings, "rutracker_filelist_ttl", 24 * 3600)
+        self.blob_ttl = getattr(settings, "rutracker_blob_ttl", 7 * 24 * 3600)
+        self.search_ttl = getattr(settings, "rutracker_search_ttl", 5 * 60)
+        self.dump_dir = getattr(settings, "debug_html_dir", "/app/debug_html")
         self._last_html: Optional[str] = None
 
         log.debug("Init with base_url=%s", self.base_url)
@@ -96,10 +96,14 @@ class RutrackerService:
     # ------------------------------------------------------------------
     # Логин
     # ------------------------------------------------------------------
+    # --- внутри RutrackerService ---
+
     def _login_sync(self):
         login_url = f"{self.base_url}/forum/login.php"
-        resp = self.scraper.get(login_url); resp.raise_for_status()
-        html = resp.text; self._last_html = html
+        resp = self.scraper.get(login_url);
+        resp.raise_for_status()
+        html = resp.text;
+        self._last_html = html
 
         try:
             doc = lxml.html.fromstring(html)
@@ -107,15 +111,16 @@ class RutrackerService:
         except Exception as e:
             os.makedirs(self.dump_dir, exist_ok=True)
             dump = os.path.join(self.dump_dir, f"login_error_{int(time.time())}.html")
-            with open(dump, "w", encoding="utf-8") as f: f.write(html)
+            with open(dump, "w", encoding="utf-8") as f:
+                f.write(html)
             log.error("Login parsing failed, dumped HTML to %s", dump, exc_info=e)
             raise RuntimeError(f"Login parsing failed — HTML dumped to {dump}") from e
 
         data = {
-            inp.get("name"): inp.get("value","")
+            inp.get("name"): inp.get("value", "")
             for inp in form.xpath(".//input[@type='hidden']") if inp.get("name")
         }
-        if token := self._extract_form_token(html):
+        if (token := self._extract_form_token(html)):
             data["form_token"] = token
         data.update({
             "login_username": settings.rutracker_login,
@@ -123,22 +128,34 @@ class RutrackerService:
             "login": form.xpath(".//input[@type='submit']/@value")[0],
         })
 
+        # делаем логин
         post = self.scraper.post(login_url, data=data, headers={"Referer": login_url}, allow_redirects=True)
-        post.raise_for_status()
+        # если пришёл 521/5xx, но cookie выставились — считаем успехом
+        try:
+            post.raise_for_status()
+        except Exception as e:
+            jar = self.scraper.cookies.get_dict()
+            if jar.get("bb_session"):
+                log.warning("Login returned %s but bb_session present -> treating as success",
+                            getattr(post, "status_code", "?"))
+            else:
+                raise
 
         jar = self.scraper.cookies.get_dict()
         if not jar.get("bb_session"):
-            # CAPTCHA required
-            cap = self.scraper.get(login_url); cap.raise_for_status()
-            cap_html = cap.text; self._last_html = cap_html
+            # CAPTCHA flow как у тебя было (без изменений)
+            cap = self.scraper.get(login_url);
+            cap.raise_for_status()
+            cap_html = cap.text;
+            self._last_html = cap_html
             cdoc = lxml.html.fromstring(cap_html)
             hidden = {
-                inp.get("name"): inp.get("value","")
+                inp.get("name"): inp.get("value", "")
                 for inp in cdoc.xpath(".//input[@type='hidden']") if inp.get("name")
             }
-            sid  = hidden.get("cap_sid", uuid.uuid4().hex)
+            sid = hidden.get("cap_sid", uuid.uuid4().hex)
             imgs = cdoc.xpath("//img[contains(@src,'/captcha/')]/@src")
-            img_url = urljoin(self.base_url+"/forum/", imgs[0]) if imgs else login_url
+            img_url = urljoin(self.base_url + "/forum/", imgs[0]) if imgs else login_url
 
             code_fields = cdoc.xpath(".//input[starts-with(@name,'cap_code_')]/@name")
             if not code_fields:
@@ -150,32 +167,52 @@ class RutrackerService:
             code_field = code_fields[0]
             submit_val = cdoc.xpath(".//input[@type='submit']/@value")[0]
             self.redis.set(f"login:{sid}", json.dumps({
-                "hidden":     hidden,
+                "hidden": hidden,
                 "code_field": code_field,
                 "submit_val": submit_val,
             }), ex=300)
             raise CaptchaRequired(sid, img_url)
 
-        # «Прогрев» сессии
-        self.scraper.get(f"{self.base_url}/forum/tracker.php").raise_for_status()
+        # «мягкий» прогрев — не рушим, если 52x/антибот
+        try:
+            warm = self.scraper.get(f"{self.base_url}/forum/tracker.php")
+            if warm.status_code >= 500:
+                log.warning("Warmup returned %d — continuing (bb_session present)", warm.status_code)
+            else:
+                warm.raise_for_status()
+        except Exception as e:
+            log.warning("Warmup exception: %s — continuing (bb_session present)", e)
 
         self.redis.set("rutracker:cookiejar", json.dumps(jar), ex=self.cookie_ttl)
         log.debug("Login succeeded, bb_session=%s", jar.get("bb_session"))
 
     def _ensure_login(self):
-        if not self.scraper.cookies.get("bb_session"):
+        # если кука есть — не лезем в логин
+        if self.scraper.cookies.get("bb_session"):
+            return
+        try:
             self._login_sync()
+        except CaptchaRequired:
+            # пробрасываем, пусть верхний уровень обработает
+            raise
+        except Exception as e:
+            # если внезапно после попытки логина кука появилась — продолжаем
+            if self.scraper.cookies.get("bb_session"):
+                log.warning("ensure_login: caught %s but bb_session present -> continue", e)
+                return
+            raise
 
     def initiate_login(self) -> Tuple[Optional[str], Optional[str]]:
         login_url = f"{self.base_url}/forum/login.php"
-        resp = self.scraper.get(login_url); resp.raise_for_status()
-        doc  = lxml.html.fromstring(resp.text)
+        resp = self.scraper.get(login_url);
+        resp.raise_for_status()
+        doc = lxml.html.fromstring(resp.text)
         form = doc.get_element_by_id("login-form-full")
         hidden = {
-            inp.get("name"): inp.get("value","")
+            inp.get("name"): inp.get("value", "")
             for inp in form.xpath(".//input[@type='hidden']") if inp.get("name")
         }
-        sid  = hidden.get("cap_sid")
+        sid = hidden.get("cap_sid")
         imgs = doc.xpath("//img[contains(@src,'/captcha/')]/@src")
         if not sid or not imgs:
             return None, None
@@ -183,11 +220,11 @@ class RutrackerService:
         submit_val = form.xpath(".//input[@type='submit']/@value")[0]
         session_id = uuid.uuid4().hex
         self.redis.set(f"login:{session_id}", json.dumps({
-            "hidden":     hidden,
+            "hidden": hidden,
             "code_field": code_field,
             "submit_val": submit_val
         }), ex=300)
-        img_url = urljoin(self.base_url+"/forum/", imgs[0])
+        img_url = urljoin(self.base_url + "/forum/", imgs[0])
         raise CaptchaRequired(session_id, img_url)
 
     def complete_login(self, session_id: str, solution: str):
@@ -199,15 +236,15 @@ class RutrackerService:
         data.update({
             "login_username": settings.rutracker_login,
             "login_password": settings.rutracker_password,
-            "cap_sid":        info["hidden"]["cap_sid"],
+            "cap_sid": info["hidden"]["cap_sid"],
             info["code_field"]: solution,
-            "login":          info["submit_val"],
+            "login": info["submit_val"],
         })
         login_url = f"{self.base_url}/forum/login.php"
         r = self.scraper.post(login_url, data=data, headers={"Referer": login_url}, allow_redirects=False)
         loc = r.headers.get("Location")
-        if loc and r.status_code in (302,303):
-            self.scraper.get(urljoin(self.base_url+"/forum/", loc)).raise_for_status()
+        if loc and r.status_code in (302, 303):
+            self.scraper.get(urljoin(self.base_url + "/forum/", loc)).raise_for_status()
         else:
             r.raise_for_status()
         # прогрев после CAPTCHA
@@ -252,6 +289,7 @@ class RutrackerService:
         директорий.
         """
         result: List[str] = []
+
         def recurse(ul: lxml.html.HtmlElement, prefix: str) -> None:
             for li in ul.xpath('./li'):
                 divs = li.xpath('./div')
@@ -266,6 +304,7 @@ class RutrackerService:
                     recurse(sub_uls[0], path)
                 else:
                     result.append(path)
+
         trees = root.xpath(
             ".//ul[contains(concat(' ', normalize-space(@class), ' '), ' ftree ')]"
         )
@@ -365,7 +404,8 @@ class RutrackerService:
                         doc2 = lxml.html.fromstring(frag2)
                         files2 = self._parse_filetree_html(doc2)
                         if files2:
-                            log.debug("viewtorrent.php (cat=%s) returned %d file entries for tid %s", cat_id, len(files2), tid)
+                            log.debug("viewtorrent.php (cat=%s) returned %d file entries for tid %s", cat_id,
+                                      len(files2), tid)
                             return files2
                     except Exception as e:
                         log.debug("Parsing filelist HTML via viewtorrent with cat_id failed for tid %s: %s", tid, e)
@@ -429,81 +469,125 @@ class RutrackerService:
     # Поиск раздач
     # ------------------------------------------------------------------
     def _search_sync(self, query: str, only_lossless: Optional[bool], track: Optional[str]) -> List[TorrentInfo]:
-        cache_key  = f"search:{query}:{only_lossless}:{track}"
+        cache_key = f"search:{query}:{only_lossless}:{track}"
         search_url = f"{self.base_url}/forum/tracker.php"
         self._ensure_login()
 
-        def guarded_get(params):
-            r = self.scraper.get(search_url, params=params, allow_redirects=False)
-            # если редирект на логин
-            if r.status_code in (301, 302) and 'login.php' in (r.headers.get('Location') or ''):
-                log.debug("Session expired on search GET, re-login")
-                self.scraper.cookies.clear()
-                self.redis.delete("rutracker:cookiejar")
-                self._login_sync()
-                r = self.scraper.get(search_url, params=params, allow_redirects=False)
-            # если обычный редирект на страницу результатов — пройти его
-            r = self._follow_normal_redirect(r)
-            return r
+        def _is_transient(status: int) -> bool:
+            # всё, что часто бывает на первом заходе / под антиботом
+            return status in (429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526)
 
-        # GET
-        r0 = guarded_get({"nm": query})
-        r0.raise_for_status()
+        def _retry(op, attempts: int = 3, backoff: float = 0.6):
+            last_exc = None
+            for i in range(attempts):
+                try:
+                    return op()
+                except Exception as e:
+                    last_exc = e
+                    time.sleep(backoff * (i + 1))
+            if last_exc:
+                raise last_exc
+
+        def guarded_get(params):
+            def _do():
+                r = self.scraper.get(search_url, params=params, allow_redirects=False)
+                # редирект на логин?
+                if r.status_code in (301, 302) and 'login.php' in (r.headers.get('Location') or ''):
+                    log.debug("Session expired on search GET, re-login")
+                    self.scraper.cookies.clear()
+                    self.redis.delete("rutracker:cookiejar")
+                    self._login_sync()
+                    r = self.scraper.get(search_url, params=params, allow_redirects=False)
+                # обычный редирект — пройти
+                r = self._follow_normal_redirect(r)
+                # транзиент? бросаем исключение, чтобы _retry повторил
+                if _is_transient(getattr(r, "status_code", 0)):
+                    raise RuntimeError(f"Transient GET status {r.status_code}")
+                r.raise_for_status()
+                return r
+
+            return _retry(_do, attempts=3, backoff=0.7)
+
+        def guarded_post(data):
+            def _do():
+                r = self.scraper.post(search_url, data=data, allow_redirects=False)
+                if r.status_code in (301, 302) and 'login.php' in (r.headers.get('Location') or ''):
+                    log.debug("Session expired on search POST, re-login")
+                    self.scraper.cookies.clear()
+                    self.redis.delete("rutracker:cookiejar")
+                    self._login_sync()
+                    r = self.scraper.post(search_url, data=data, allow_redirects=False)
+                r = self._follow_normal_redirect(r)
+                if _is_transient(getattr(r, "status_code", 0)):
+                    raise RuntimeError(f"Transient POST status {r.status_code}")
+                r.raise_for_status()
+                return r
+
+            return _retry(_do, attempts=3, backoff=0.7)
+
+        # ---------- GET (форма/токен) ----------
+        try:
+            r0 = guarded_get({"nm": query})
+        except Exception as e:
+            log.warning("Search GET failed after retries: %s", e)
+            raise HTTPException(status_code=502, detail="Rutracker GET search failed (temporary)")
+
         html0 = r0.text or ""
         if 'id="login-form-full"' in html0:
+            # бывает, если антибот подсунул логин ещё раз
             log.debug("Search GET returned login page, re-login")
             self.scraper.cookies.clear()
             self.redis.delete("rutracker:cookiejar")
             self._login_sync()
-            r0 = guarded_get({"nm": query})
-            r0.raise_for_status()
-        self._last_html = r0.text
+            try:
+                r0 = guarded_get({"nm": query})
+            except Exception as e:
+                log.warning("Search GET (after re-login) failed: %s", e)
+                raise HTTPException(status_code=502, detail="Rutracker GET search failed (after login)")
 
-        # POST
+        self._last_html = r0.text
         token = self._extract_form_token(r0.text)
         post_data = {"nm": query, "f[]": "-1"}
         if token:
             post_data["form_token"] = token
 
-        r1 = self.scraper.post(search_url, data=post_data, allow_redirects=False)
-        # если редирект на логин
-        if r1.status_code in (301, 302) and 'login.php' in (r1.headers.get('Location') or ''):
-            log.debug("Session expired on search POST, re-login")
-            self.scraper.cookies.clear()
-            self.redis.delete("rutracker:cookiejar")
-            self._login_sync()
-            r1 = self.scraper.post(search_url, data=post_data, allow_redirects=False)
-        # если обычный редирект (на страницу результатов) — пройти его
-        r1 = self._follow_normal_redirect(r1)
+        # ---------- POST (результаты) ----------
+        try:
+            r1 = guarded_post(post_data)
+        except Exception as e:
+            log.warning("Search POST failed after retries: %s", e)
+            raise HTTPException(status_code=502, detail="Rutracker POST search failed (temporary)")
 
-        r1.raise_for_status()
         html1 = r1.text or ""
         if 'id="login-form-full"' in html1:
             log.debug("Search POST returned login page, re-login")
             self.scraper.cookies.clear()
             self.redis.delete("rutracker:cookiejar")
             self._login_sync()
-            r1 = self.scraper.post(search_url, data=post_data, allow_redirects=False)
-            r1 = self._follow_normal_redirect(r1)
-            r1.raise_for_status()
+            try:
+                r1 = guarded_post(post_data)
+            except Exception as e:
+                log.warning("Search POST (after re-login) failed: %s", e)
+                raise HTTPException(status_code=502, detail="Rutracker POST search failed (after login)")
 
+        # ---------- парсинг ----------
         doc = lxml.html.fromstring(r1.text)
-        parsed: List[Tuple[TorrentInfo,int]] = []
+        parsed: List[Tuple[TorrentInfo, int]] = []
         for row in doc.xpath("//table[@id='tor-tbl']//tr[@data-topic_id]"):
             hrefs = row.xpath(".//a[contains(@href,'dl.php?t=')]/@href")
             if not hrefs:
                 continue
-            tid       = int(row.get("data-topic_id"))
+            tid = int(row.get("data-topic_id"))
             forum_txt = (row.xpath(".//td[contains(@class,'f-name-col')]//a/text()") or [""])[0].strip()
             title_txt = (row.xpath(".//td[contains(@class,'t-title-col')]//a/text()") or [""])[0].strip()
-            combined  = f"{forum_txt} {title_txt}".strip()
+            combined = f"{forum_txt} {title_txt}".strip()
             is_l = bool(_LOSSLESS_RE.search(combined))
             is_y = bool(_LOSSY_RE.search(combined))
-            if only_lossless is True  and (not is_l or is_y): continue
+            if only_lossless is True and (not is_l or is_y): continue
             if only_lossless is False and is_l: continue
-            size   = (row.xpath(".//td[contains(@class,'tor-size')]//a/text()") or [""])[0].strip()
-            se     = int((row.xpath(".//b[contains(@class,'seedmed')]/text()") or ["0"])[0].strip())
-            le     = int((row.xpath(".//td[contains(@class,'leechmed')]/text()") or ["0"])[0].strip())
+            size = (row.xpath(".//td[contains(@class,'tor-size')]//a/text()") or [""])[0].strip()
+            se = int((row.xpath(".//b[contains(@class,'seedmed')]/text()") or ["0"])[0].strip())
+            le = int((row.xpath(".//td[contains(@class,'leechmed')]/text()") or ["0"])[0].strip())
             url_dl = urljoin(self.base_url + "/forum/", hrefs[0])
             parsed.append((TorrentInfo(
                 title=combined, url=url_dl, size=size, seeders=se, leechers=le
@@ -511,7 +595,7 @@ class RutrackerService:
 
         # фильтр по треку
         if track:
-            from rapidfuzz import fuzz
+            from rapidfuzz import fuzz as rf_fuzz
             results = []
             t_low = track.lower()
             for ti, tid in parsed:
@@ -522,13 +606,13 @@ class RutrackerService:
                     files = self._get_filelist(tid)
                 except CaptchaRequired:
                     continue
-                if any(t_low in f.lower() or fuzz.partial_ratio(t_low, f.lower()) >= 80 for f in files):
+                if any(t_low in f.lower() or rf_fuzz.partial_ratio(t_low, f.lower()) >= 80 for f in files):
                     results.append(ti)
             final = results
         else:
             final = [ti for ti, _ in parsed]
 
-        # кеширование
+        # кеш
         to_cache = [
             {"title": r.title, "url": r.url, "size": r.size,
              "seeders": r.seeders, "leechers": r.leechers}
@@ -549,29 +633,32 @@ class RutrackerService:
         dl_url = f"{self.base_url}/forum/dl.php?t={topic_id}"
         resp = self.scraper.get(dl_url, allow_redirects=True)
         resp.raise_for_status()
-        ctype = resp.headers.get("Content-Type","")
+        ctype = resp.headers.get("Content-Type", "")
         if "application/x-bittorrent" in ctype:
             return resp.content
         # HTML вместо торрента
-        html = resp.text; self._last_html = html
+        html = resp.text;
+        self._last_html = html
         os.makedirs(self.dump_dir, exist_ok=True)
         path = os.path.join(self.dump_dir, f"download_error_{topic_id}_{int(time.time())}.html")
-        with open(path, "w", encoding="utf-8") as f: f.write(html)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
         log.error("Download failed, dumped HTML to %s", path)
         if "исчерпали суточный лимит" in html:
             raise HTTPException(status_code=429, detail="Daily download limit exceeded (1000/day)")
         doc = lxml.html.fromstring(html)
-        hidden      = {inp.get("name"): inp.get("value","") for inp in doc.xpath(".//input[@type='hidden']") if inp.get("name")}
+        hidden = {inp.get("name"): inp.get("value", "") for inp in doc.xpath(".//input[@type='hidden']") if
+                  inp.get("name")}
         code_fields = doc.xpath(".//input[starts-with(@name,'cap_code_')]/@name")
-        imgs        = doc.xpath("//img[contains(@src,'/captcha/')]/@src")
+        imgs = doc.xpath("//img[contains(@src,'/captcha/')]/@src")
         if not code_fields or not imgs:
             raise RuntimeError(f"Download parsing failed — HTML dumped to {path}")
-        sid        = hidden.get("cap_sid", uuid.uuid4().hex)
-        img_url    = urljoin(self.base_url+"/forum/", imgs[0])
+        sid = hidden.get("cap_sid", uuid.uuid4().hex)
+        img_url = urljoin(self.base_url + "/forum/", imgs[0])
         code_field = code_fields[0]
         submit_val = doc.xpath(".//input[@type='submit']/@value")[0]
         self.redis.set(f"login:{sid}", json.dumps({
-            "hidden":     hidden,
+            "hidden": hidden,
             "code_field": code_field,
             "submit_val": submit_val,
         }), ex=300)
