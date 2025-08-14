@@ -41,7 +41,7 @@ class RutrackerService:
     """Сервис для взаимодействия с форумом RuTracker.
 
     Поддерживает аутентификацию, поиск, фильтрацию, получение файловых
-    списков и скачивание `.torrent`‑файлов. Для оптимизации при фильтрации
+    списков и скачивание `.torrent`-файлов. Для оптимизации при фильтрации
     по имени трека сначала пытается получить список файлов из HTML, а затем
     при необходимости скачивает торрент.
     """
@@ -71,12 +71,31 @@ class RutrackerService:
             log.exception("Cookie restore failed")
 
     # ------------------------------------------------------------------
-    # Вспомогательные методы для логина
+    # Вспомогательные методы
     # ------------------------------------------------------------------
     def _extract_form_token(self, html: str) -> str:
         m = _FORM_TOKEN_RE.search(html)
         return m.group(1) if m else ""
 
+    def _follow_normal_redirect(self, resp):
+        """Если это обычный 30x (НЕ на login.php) — проходим редирект и возвращаем конечный ответ."""
+        try:
+            if resp is None:
+                return resp
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("Location") or ""
+                if loc and "login.php" not in loc:
+                    url = urljoin(self.base_url + "/forum/", loc)
+                    r2 = self.scraper.get(url, allow_redirects=True)
+                    # если и тут редирект — requests сам догрызёт благодаря allow_redirects=True
+                    return r2
+        except Exception as e:
+            log.debug("Failed to follow normal redirect: %s", e)
+        return resp
+
+    # ------------------------------------------------------------------
+    # Логин
+    # ------------------------------------------------------------------
     def _login_sync(self):
         login_url = f"{self.base_url}/forum/login.php"
         resp = self.scraper.get(login_url); resp.raise_for_status()
@@ -199,7 +218,7 @@ class RutrackerService:
         self.redis.set("rutracker:cookiejar", json.dumps(jar), ex=self.cookie_ttl)
 
     # ------------------------------------------------------------------
-    # Работа с торрент‑файлами и списоком файлов
+    # Работа с торрент-файлами и списоком файлов
     # ------------------------------------------------------------------
     def _get_torrent_blob(self, tid: int) -> bytes:
         key = f"torrentblob:{tid}"
@@ -223,7 +242,7 @@ class RutrackerService:
     # HTML file list parsing
     # ------------------------------------------------------------------
     def _parse_filetree_html(self, root: lxml.html.HtmlElement) -> List[str]:
-        """Собирает список файлов из HTML‑дерева RuTracker.
+        """Собирает список файлов из HTML-дерева RuTracker.
 
         На странице раздачи RuTracker размещает список файлов в виде
         вложенного `<ul class="ftree">`.  Однако класс `ftree` встречается
@@ -260,8 +279,8 @@ class RutrackerService:
 
         Для разных версий RuTracker API могут использоваться разные
         параметры: ``t`` (topic ID) сам по себе, ``cat`` или ``cat_id``.
-        Этот метод по очереди пытается несколько комбинаций POST‑параметров
-        и, если POST возвращает пустую страницу, аналогичный GET‑запрос.
+        Этот метод по очереди пытается несколько комбинаций POST-параметров
+        и, если POST возвращает пустую страницу, аналогичный GET-запрос.
         Возвращает первую непустую строку HTML или ``None``.
         """
         self._ensure_login()
@@ -370,7 +389,7 @@ class RutrackerService:
         """Возвращает список файлов для указанного torrent ID.
 
         Сначала пытается взять список файлов из кэша.  Затем — парсит
-        HTML‑страницу раздачи; если удаётся, использует этот список.  В
+        HTML-страницу раздачи; если удаётся, использует этот список.  В
         противном случае скачивает и декодирует `.torrent` файл.  Каждый
         шаг сопровождается логом, сообщающим, откуда был получен список.
         """
@@ -413,15 +432,20 @@ class RutrackerService:
         cache_key  = f"search:{query}:{only_lossless}:{track}"
         search_url = f"{self.base_url}/forum/tracker.php"
         self._ensure_login()
+
         def guarded_get(params):
             r = self.scraper.get(search_url, params=params, allow_redirects=False)
+            # если редирект на логин
             if r.status_code in (301, 302) and 'login.php' in (r.headers.get('Location') or ''):
                 log.debug("Session expired on search GET, re-login")
                 self.scraper.cookies.clear()
                 self.redis.delete("rutracker:cookiejar")
                 self._login_sync()
                 r = self.scraper.get(search_url, params=params, allow_redirects=False)
+            # если обычный редирект на страницу результатов — пройти его
+            r = self._follow_normal_redirect(r)
             return r
+
         # GET
         r0 = guarded_get({"nm": query})
         r0.raise_for_status()
@@ -434,18 +458,24 @@ class RutrackerService:
             r0 = guarded_get({"nm": query})
             r0.raise_for_status()
         self._last_html = r0.text
+
         # POST
         token = self._extract_form_token(r0.text)
         post_data = {"nm": query, "f[]": "-1"}
         if token:
             post_data["form_token"] = token
+
         r1 = self.scraper.post(search_url, data=post_data, allow_redirects=False)
+        # если редирект на логин
         if r1.status_code in (301, 302) and 'login.php' in (r1.headers.get('Location') or ''):
             log.debug("Session expired on search POST, re-login")
             self.scraper.cookies.clear()
             self.redis.delete("rutracker:cookiejar")
             self._login_sync()
             r1 = self.scraper.post(search_url, data=post_data, allow_redirects=False)
+        # если обычный редирект (на страницу результатов) — пройти его
+        r1 = self._follow_normal_redirect(r1)
+
         r1.raise_for_status()
         html1 = r1.text or ""
         if 'id="login-form-full"' in html1:
@@ -454,7 +484,9 @@ class RutrackerService:
             self.redis.delete("rutracker:cookiejar")
             self._login_sync()
             r1 = self.scraper.post(search_url, data=post_data, allow_redirects=False)
+            r1 = self._follow_normal_redirect(r1)
             r1.raise_for_status()
+
         doc = lxml.html.fromstring(r1.text)
         parsed: List[Tuple[TorrentInfo,int]] = []
         for row in doc.xpath("//table[@id='tor-tbl']//tr[@data-topic_id]"):
@@ -476,6 +508,7 @@ class RutrackerService:
             parsed.append((TorrentInfo(
                 title=combined, url=url_dl, size=size, seeders=se, leechers=le
             ), tid))
+
         # фильтр по треку
         if track:
             from rapidfuzz import fuzz
@@ -494,6 +527,7 @@ class RutrackerService:
             final = results
         else:
             final = [ti for ti, _ in parsed]
+
         # кеширование
         to_cache = [
             {"title": r.title, "url": r.url, "size": r.size,
@@ -508,7 +542,7 @@ class RutrackerService:
         return await asyncio.to_thread(self._search_sync, query, only_lossless, track)
 
     # ------------------------------------------------------------------
-    # Скачивание торрент‑файла
+    # Скачивание торрент-файла
     # ------------------------------------------------------------------
     def _download_sync(self, topic_id: int) -> bytes:
         self._ensure_login()
